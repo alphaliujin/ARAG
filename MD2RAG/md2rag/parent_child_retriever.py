@@ -98,7 +98,7 @@ class ParentChildRetriever:
         ids = ids or [d for d in doc_ids]
         if embeddings is None:
             embeddings = self.embedder.embed(texts)
-        coll.add(documents=texts, embeddings=embeddings, metadatas=metas, ids=ids)
+        coll.upsert(documents=texts, embeddings=embeddings, metadatas=metas, ids=ids)
         return len(chunks)
 
     def add_child_chunks(
@@ -135,7 +135,7 @@ class ParentChildRetriever:
         metas = [{**m, "is_child": True, "parent_doc_id": m.get("parent_doc_id") or m.get("doc_id", "")} for m in metas]
         if embeddings is None:
             embeddings = self.embedder.embed(texts)
-        coll.add(documents=texts, embeddings=embeddings, metadatas=metas, ids=ids)
+        coll.upsert(documents=texts, embeddings=embeddings, metadatas=metas, ids=ids)
         return len(chunks)
 
     def add_parent_child_pair(

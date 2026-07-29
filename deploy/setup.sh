@@ -2,7 +2,7 @@
 # =============================================================================
 # ARAG_V0.2 部署安装脚本 - 在目标 Linux 机器上执行一次
 # 用法: ./setup.sh
-# 做的事: 检查依赖 -> 建 venv -> 装 Python 依赖 -> 拉 Ollama 模型 -> 配置路径/数据目录
+# 做的事: 检测并自动安装系统依赖 -> 建 venv -> 装 Python 依赖 -> 拉 Ollama 模型 -> 配置路径/数据目录
 # =============================================================================
 set -uo pipefail
 INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -18,17 +18,82 @@ echo "$(color 36)═════════════════════
 echo "  ARAG_V0.2 部署安装  (install dir: $INSTALL_DIR)"
 echo "$(color 36)═══════════════════════════════════════════════════$(color 0)"
 
-# ---------- 1. 依赖检查 ----------
-info "1/5 检查系统依赖..."
-miss=()
-for cmd in python3 pip3 ollama curl; do
-  command -v "$cmd" >/dev/null 2>&1 || miss+=("$cmd")
-done
-[ ${#miss[@]} -gt 0 ] && die "缺少命令: ${miss[*]}。请先安装 (macOS: brew; Debian/Ubuntu: apt-get install -y python3 python3-pip curl && curl -fsSL https://ollama.com/install.sh | sh)"
+# ---------- 1. 系统依赖 (检测 + 自动安装) ----------
+info "1/5 检测系统依赖 (缺失自动安装)..."
+# sudo 前缀: 非 root 且有 sudo 时使用 (apt/systemctl 需要)
+SUDO=""
+if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then SUDO="sudo"; fi
+
+# 1a. 检测缺失的必需包: python3 / pip3 / curl / python3-venv
+need_pkgs=()
+command -v python3 >/dev/null 2>&1 || need_pkgs+=(python3)
+command -v pip3    >/dev/null 2>&1 || need_pkgs+=(python3-pip)
+command -v curl    >/dev/null 2>&1 || need_pkgs+=(curl)
+# Debian/Ubuntu 上 `python3 -m venv` 由独立包 python3-venv 提供, 常不随 python3 安装
+if ! python3 -m venv --help >/dev/null 2>&1; then need_pkgs+=(python3-venv); fi
+
+if [ ${#need_pkgs[@]} -gt 0 ]; then
+  # 识别包管理器 (DGX Spark/Ubuntu 用 apt-get)
+  pm=""
+  for p in apt-get apt dnf yum; do command -v "$p" >/dev/null 2>&1 && { pm="$p"; break; }; done
+  if [ -z "$pm" ]; then
+    die "缺少: ${need_pkgs[*]}。未识别到包管理器 (apt/dnf/yum), 请手动安装后重试。"
+  fi
+  # dnf/yum 上 venv 随 python3 自带, 没有 python3-venv 包 -> 替换成 python3
+  if [ "$pm" = "dnf" ] || [ "$pm" = "yum" ]; then
+    need_pkgs=("${need_pkgs[@]/python3-venv/python3}")
+  fi
+  info "通过 $pm 自动安装: ${need_pkgs[*]}"
+  if [ "$pm" = "apt-get" ] || [ "$pm" = "apt" ]; then
+    $SUDO "$pm" update -qq 2>/dev/null || true
+  fi
+  $SUDO "$pm" install -y "${need_pkgs[@]}" || die "系统依赖安装失败, 请手动安装: ${need_pkgs[*]}"
+fi
+# 复检 (apt 装完仍可能因 PATH/版本不符失败, 这里兜底)
+command -v python3 >/dev/null 2>&1 || die "python3 仍不可用"
+command -v curl    >/dev/null 2>&1 || die "curl 仍不可用"
+python3 -m venv --help >/dev/null 2>&1 || die "python3-venv 仍不可用 (python3 -m venv 失败)"
 python3 -c 'import sys; sys.exit(0 if sys.version_info>=(3,9) else 1)' || die "Python 版本需 >= 3.9 (当前 $(python3 --version))"
-# antiword/soffice 仅 .doc/.ppt 转换需要; 缺失只警告
+ok "系统依赖就绪 (python3 / pip3 / venv / curl)"
+
+# 1b. Ollama (缺失则用官方脚本自动装; 支持 aarch64/x86_64, 脚本内部自理 sudo)
+if ! command -v ollama >/dev/null 2>&1; then
+  info "未检测到 Ollama, 通过官方脚本安装 (支持 aarch64/x86_64)..."
+  curl -fsSL https://ollama.com/install.sh | sh || die "Ollama 安装失败。可手动: curl -fsSL https://ollama.com/install.sh | sh"
+  ok "Ollama 安装完成"
+else
+  ok "Ollama 已安装"
+fi
+# 1c. Ollama 服务未运行则自动启动 (systemd 优先, 回退 nohup ollama serve)
+if ! curl -s http://localhost:11434/api/tags >/dev/null 2>&1; then
+  info "Ollama 服务未运行, 尝试启动..."
+  if command -v systemctl >/dev/null 2>&1 && $SUDO systemctl start ollama 2>/dev/null; then
+    : # systemd 已拉起
+  else
+    nohup ollama serve > "$INSTALL_DIR/.ollama.log" 2>&1 &
+  fi
+  # 等待就绪 (最多 ~20s)
+  for i in $(seq 1 20); do curl -s http://localhost:11434/api/tags >/dev/null 2>&1 && break; sleep 1; done
+  curl -s http://localhost:11434/api/tags >/dev/null 2>&1 && ok "Ollama 服务已就绪" || warn "Ollama 未就绪, 稍后手动: ollama serve (日志: .ollama.log)"
+fi
+
+# 1d. 可选: antiword/libreoffice (.doc/.ppt 转换); 缺失只警告
 for cmd in antiword soffice libreoffice; do command -v "$cmd" >/dev/null 2>&1 && break; done || warn "未找到 antiword/libreoffice: .doc/.ppt 转换会受限 (其它格式不受影响)"
 ok "依赖检查通过"
+
+# ---------- GPU / 架构检测 (DGX Spark 等带 NVIDIA GPU 的机器) ----------
+arch="$(uname -m)"
+case "$arch" in
+  aarch64|arm64) ok "架构 $arch (ARM64, 如 DGX Spark Grace Hopper - 源码部署包原生支持)" ;;
+  x86_64)        ok "架构 $arch (x86_64)" ;;
+  *)             warn "架构 $arch 未测试, 若依赖装不上请反馈" ;;
+esac
+if command -v nvidia-smi >/dev/null 2>&1; then
+  gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+  [ -n "$gpu" ] && ok "NVIDIA GPU: $gpu (Ollama bge-m3 嵌入将走 GPU 加速)" || warn "nvidia-smi 在但读不到 GPU, Ollama 将退回 CPU 嵌入"
+else
+  warn "未检测到 nvidia-smi: Ollama 将用 CPU 嵌入 (慢)。DGX Spark 应有 GPU, 请确认 NVIDIA 驱动已装"
+fi
 
 # ---------- 2. 虚拟环境 ----------
 info "2/5 创建 Python 虚拟环境..."

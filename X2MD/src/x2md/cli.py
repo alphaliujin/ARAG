@@ -38,7 +38,7 @@ from x2md.chunk import Chunk, ChunkSplitter, SmallerChunksStrategy, aggregate_ch
     "--no-ocr",
     is_flag=True,
     default=False,
-    help="Disable OCR for image files (return placeholder instead of running tesseract).",
+    help="Disable OCR for image files (return placeholder instead of running OCR).",
 )
 @click.option(
     "--encoding",
@@ -307,7 +307,10 @@ def _build_kwargs(
 
     img_cfg = cfg.section("image")
     kwargs["ocr_lang"] = ocr_lang or img_cfg.get("ocr_lang", "eng")
-    # OCR 总开关: --no-ocr 时 ImageConverter 跳过 tesseract 直接返回占位符
+    # OCR 引擎 + 模型: paddleocr (PP-OCRv6_medium) | tesseract
+    kwargs["ocr_engine"] = img_cfg.get("ocr_engine", "paddleocr")
+    kwargs["ocr_paddle_model"] = img_cfg.get("ocr_paddle_model", "PP-OCRv6_medium")
+    # OCR 总开关: --no-ocr 时 ImageConverter 跳过 OCR 直接返回占位符
     kwargs["enable_ocr"] = not no_ocr
 
     kwargs["encoding"] = encoding or cfg.encoding

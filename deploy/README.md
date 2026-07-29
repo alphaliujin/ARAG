@@ -8,8 +8,8 @@
 | 项 | 要求 |
 |---|---|
 | OS | Linux (x86_64 / arm64),内核较新即可 |
-| Python | >= 3.9 |
-| Ollama | 已安装并运行 (`curl -fsSL https://ollama.com/install.sh \| sh`) |
+| Python | >= 3.9 (缺失时 setup.sh 自动安装) |
+| Ollama | 可选 (缺失时 setup.sh 自动安装并启动服务) |
 | 可选 | `antiword` / `libreoffice` (仅 .doc/.ppt 转换需要; docx/pdf/xlsx/pptx/html/md 不需要) |
 
 内存建议 >= 8GB(嵌入时 ChromaDB + Ollama 同时占用)。磁盘: 依赖安装约 3-4GB(含 torch/chromadb),
@@ -23,7 +23,7 @@ cd ARAG_V0.2
 ./setup.sh
 ```
 
-`setup.sh` 会: 检查依赖 → 建 venv → 装 Python 依赖(首次较慢) → `ollama pull bge-m3:latest` →
+`setup.sh` 会: 检测并自动安装系统依赖(python3/pip3/python3-venv/curl/Ollama, 缺失才装) → 建 venv → 装 Python 依赖(首次较慢) → `ollama pull bge-m3:latest` →
 把配置里的 `__INSTALL_DIR__` 替换为实际路径 → 建数据目录骨架。
 
 ## 三、启动 / 停止
@@ -83,3 +83,21 @@ ARAG_HOST=0.0.0.0 ARAG_PORT=9000 ./start.sh
 
 - 默认 `AUTH_DISABLED=True` 仅为方便内网部署, **生产环境务必设 `API_KEY` 并启用认证**。
 - 系统处理的可能是机密文档, 部署机器的 `DOC/`、`MD/`、`vector_db/`、`DocScan/`、`dedup_results/` 含明文内容, 注意磁盘访问控制。
+
+
+## 九、DGX Spark 部署说明
+
+DGX Spark (NVIDIA GH200 Grace Hopper, ARM64/aarch64, Ubuntu + NVIDIA GPU) 是本系统的典型部署目标。
+源码部署包架构无关, 在 DGX Spark 上原生可用, 注意以下几点:
+
+- **架构 aarch64**: `setup.sh` 会装 aarch64 wheel (fastapi/chromadb/numpy/pdfplumber 等均有 aarch64 wheel);
+  `sentence-transformers` 会拉 torch (aarch64 wheel, 体积较大, 首次安装慢)。本系统**实际嵌入走 Ollama**,
+  torch 仅因 sentence-transformers 被装上, 不影响运行。
+- **GPU 加速**: 确保 NVIDIA 驱动 + CUDA 已装 (DGX Spark 出厂自带)。`setup.sh` 会检测 `nvidia-smi`;
+  Ollama 自动用 GPU 跑 bge-m3, 嵌入速度远快于 CPU。
+- **Ollama**: setup.sh 检测到缺失会自动用官方脚本安装 (支持 aarch64) 并启动服务, 无需手动。
+- **内存**: DGX Spark 统一内存 128GB/288GB, 远超本系统需要 (ChromaDB + Ollama 同占通常 < 8GB)。
+- **端口检测**: `start.sh` 的 stop/status 已兼容无 `lsof` 的 Ubuntu (回退 `ss`/`fuser`)。
+- **绑定地址**: 默认 `0.0.0.0:8000`, 局域网内可直接访问前端。如需仅本机访问: `ARAG_HOST=127.0.0.1 ./start.sh`。
+- **认证**: 默认 `AUTH_DISABLED=True` 仅限内网。DGX Spark 上跑机密文档时, 务必在 `backend/.env` 设
+  `API_KEY=xxx` 并删除/置 False `AUTH_DISABLED`, 前端构建时注入 `REACT_APP_API_KEY`。

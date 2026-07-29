@@ -19,7 +19,9 @@
 
 from md2rag.bbox_extractor import (
     LineInfo,
+    LineIndex,
     assign_bboxes_to_chunk,
+    build_line_index,
     get_bboxes_for_record,
     make_synthetic_bboxes,
 )
@@ -61,6 +63,7 @@ __all__ = [
     "IndexResult",
     "RetrievalHit",
     "LineInfo",
+    "LineIndex",
     "ChunkFileType",
     # 核心类
     "ChunkLoader",
@@ -80,6 +83,7 @@ __all__ = [
     "make_synthetic_bboxes",
     "assign_bboxes_to_chunk",
     "get_bboxes_for_record",
+    "build_line_index",
     # 图片
     "ViTImageEmbedder",
     "ImageProcessor",

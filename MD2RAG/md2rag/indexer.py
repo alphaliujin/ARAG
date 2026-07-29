@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from md2rag.bbox_extractor import get_bboxes_for_record
+from md2rag.bbox_extractor import build_line_index, get_bboxes_for_record
 from md2rag.config import MD2RAGConfig, load_config
 from md2rag.embedder import Embedder, create_embedder
 from md2rag.image_processor import ImageProcessor, ViTImageEmbedder
@@ -471,6 +471,9 @@ class Indexer:
                 except Exception as e:
                     logger.warning(f"[INDEX] Failed to read MD {md_path}: {e}")
 
+            # 行级索引每文件构建一次, 复用给本文件所有 parent/child (避免大文件 CPU 瓶颈)
+            line_index = build_line_index(source_text) if source_text else None
+
             # 4.2 处理 parents
             for p in parents:
                 if regenerate_abstract and self._llm_client:
@@ -480,7 +483,7 @@ class Indexer:
 
                 # bbox 关联
                 if not p.bbox and source_text:
-                    bboxes = get_bboxes_for_record(p.text, source_text)
+                    bboxes = get_bboxes_for_record(p.text, source_text, line_index=line_index)
                     if bboxes:
                         p.bbox = str(bboxes)
 
@@ -506,7 +509,7 @@ class Indexer:
                         c.abstract = new_abs
 
                 if not c.bbox and source_text:
-                    bboxes = get_bboxes_for_record(c.text, source_text)
+                    bboxes = get_bboxes_for_record(c.text, source_text, line_index=line_index)
                     if bboxes:
                         c.bbox = str(bboxes)
 

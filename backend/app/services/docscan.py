@@ -483,6 +483,7 @@ class DocScanService:
                 model_type="ollama",
                 ollama_url=settings.OLLAMA_BASE_URL,
                 ollama_model="bge-m3:latest",
+                ollama_cache_path=os.path.join(settings.VECTOR_DB_DIR, "md2rag_embedding_cache.sqlite"),
             )
         elif settings.EMBEDDING_MODEL == "mps-bge-m3":
             self._embedder = create_embedder(

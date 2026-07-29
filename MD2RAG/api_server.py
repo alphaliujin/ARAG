@@ -11,7 +11,7 @@ from typing import Optional
 
 from md2rag.config import MD2RAGConfig, load_config
 from md2rag.indexer import Indexer
-from md2rag.loader import CLASSIFICATION_DIR_MAP, VALID_CLASSIFICATIONS
+from md2rag.loader import CLASSIFICATION_DIR_MAP
 from md2rag.logger import get_logger, log_step, log_timing
 
 # 创建日志记录器
@@ -141,16 +141,26 @@ def search_documents(request: SearchRequest):
     """搜索相似文档."""
     logger.info(f"[SEARCH] query='{request.query}', classification={request.classification}")
 
-    classifications = [request.classification] if request.classification else None
-    if classifications is None:
-        classifications = list(VALID_CLASSIFICATIONS)
-
     start_time = time.time()
-    results = _indexer.store.search_all(
-        query_text=request.query,
-        classifications=classifications,
+    # 走 Indexer.search -> ParentChildRetriever, 检索 md2rag_<cls>_{parent,child} collection。
+    # 旧实现调 store.search_all() 查的是空的基础 collection md2rag_<cls>, 永远无结果。
+    raw = _indexer.search(
+        query=request.query,
+        classification=request.classification,
         n_results=request.n_results,
+        return_parents=False,
     )
+    results = {
+        cls: [
+            {
+                "content": h.get("content"),
+                "metadata": h.get("metadata"),
+                "similarity": h.get("score"),
+            }
+            for h in hits
+        ]
+        for cls, hits in raw.items()
+    }
     elapsed = (time.time() - start_time) * 1000
     log_timing(logger, "Search operation", elapsed)
 

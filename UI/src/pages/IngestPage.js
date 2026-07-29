@@ -183,20 +183,31 @@ const IngestPage = () => {
   const confirmModelChange = async () => {
     setModelChangeModal(false);
     if (!pendingModel) return;
+    if (clearing) { message.info('正在清空中，请稍后再切换模型'); return; }
+    setClearing(true);
     try {
       // 先把新模型持久化到 /settings/model (settings_service 会校验白名单并应用到运行时),
       // 否则后续 loadStatus (含 5s 自动刷新) 会从服务器读回旧值, 把本地状态覆盖回去,
       // 造成"看似已切换、实际仍用旧模型入库"的假切换。
       await apiClient.put('/settings/model', { values: { embeddingModel: pendingModel } });
       setEmbeddingModel(pendingModel);
-      await apiClient.delete(`/reset`);
-      message.success('向量数据库已清空，嵌入模型已切换');
+      const res = await apiClient.delete(`/reset`);
+      const status = res?.data?.status;
+      if (status === 'busy') {
+        message.info('正在清空中，请勿重复点击');
+      } else if (status === 'partial') {
+        message.warning('向量库部分清空: ' + (res?.data?.message || '仍有残留'));
+      } else {
+        message.success('向量数据库已清空，嵌入模型已切换');
+      }
       await loadStatus();
       setFileList([]);
     } catch (error) {
       message.error('切换模型失败: ' + (error.response?.data?.detail || error.message || '未知错误'));
       // 持久化或清库失败时, 静默回读服务器实际模型, 避免本地与服务器不一致
       await loadStatus(true);
+    } finally {
+      setClearing(false);
     }
     setPendingModel(null);
   };
@@ -295,12 +306,22 @@ const IngestPage = () => {
       okType: 'danger',
       cancelText: '取消',
       onOk: async () => {
+        if (clearing) return; // 防双击: 已在清空中则忽略 (后端 _reset_lock 为最终互斥保障)
         setClearing(true);
         try {
-          await apiClient.delete(`/reset`);
-          message.success('向量数据库已清空');
-          await loadStatus();
-          setFileList([]);
+          const res = await apiClient.delete(`/reset`);
+          const status = res?.data?.status;
+          const detail = res?.data?.message || '';
+          if (status === 'busy') {
+            message.info('正在清空中，请勿重复点击');
+          } else if (status === 'partial') {
+            message.warning('部分清空: ' + (detail || '仍有残留向量，请稍后重试'));
+            await loadStatus();
+          } else {
+            message.success('向量数据库已清空');
+            await loadStatus();
+            setFileList([]);
+          }
         } catch (error) {
           message.error('清空数据库失败: ' + (error.response?.data?.detail || error.message || '未知错误'));
         } finally {

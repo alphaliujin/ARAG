@@ -34,7 +34,6 @@ import numpy as np
 from app.core.config import settings
 from app.services.docscan import (
     BGE_M3_BASELINE,
-    adjust_similarity,
     text_ngram_overlap,
     longest_matching_run,
     build_ngram_index,
@@ -313,60 +312,68 @@ class DataDeduplicationService:
             # 计算相似度矩阵: (batch_size, dim) @ (dim, N_target)
             sim_batch = batch_vecs @ target_embeddings.T
 
-            # 查找匹配
-            for j in range(batch_end - batch_start):
-                source_idx = batch_start + j
-                # 跳过零向量
-                if np.linalg.norm(batch_vecs[j]) == 0:
-                    continue
+            # 向量化重标定 + 阈值筛选, 替代原先逐 (j,k) 的 Python 双重循环
+            # (大集合如 2196×2741≈600 万对, 纯 Python 循环 + 逐对调 adjust_similarity 很慢)。
+            # adjust_similarity 是单调线性映射 max(0,(raw-B)/(1-B)), 故 adjusted>=0.5
+            # 等价于 raw>=B+0.5*(1-B); 直接对整个矩阵做 numpy 掩码, 只对命中的少数对
+            # 跑 n-gram 合议与分桶。结果与原实现逐位等价 (IEEE754 逐元素运算一致),
+            # 命中对顺序与原 j 外层/k 内层循环一致 (argwhere 返回 C-order)。
+            # 注意: sim_batch 是 float32 (源/目标向量均为 float32)。原实现用 float(sim)
+            # 把每个值提升为 float64 再算 adjust; 为逐位等价这里也先转 float64, 否则
+            # float32 运算会在 ~第8位有效数字出现差异, 可能把边界对 (adjusted≈0.5/0.65/0.8)
+            # 分到不同桶或在阈值处翻转匹配集。
+            adjusted_batch = np.maximum(
+                0.0, (sim_batch.astype(np.float64) - BGE_M3_BASELINE) / (1.0 - BGE_M3_BASELINE)
+            )
+            # 跳过零向量行 (与原 np.linalg.norm(batch_vecs[j])==0 一致)
+            batch_norms = np.linalg.norm(batch_vecs, axis=1)
+            match_mask = (adjusted_batch >= 0.5) & (batch_norms != 0)[:, None]
 
-                similarities = sim_batch[j]
+            for j, k in np.argwhere(match_mask):
+                source_idx = batch_start + int(j)
+                similarity = float(sim_batch[j, k])
+                adjusted_sim = float(adjusted_batch[j, k])
+                # 结果按 adjusted 三档分类 (与 DocScan 一致):
+                # ≥0.8: 高度相似(几乎确定是重复)
+                # 0.5-0.8: 中度相似(主题相近, 需要人工确认)
+                # <0.5: 弱相关(语义有交叠但不算重复) -- 已被掩码过滤
+                source_meta = source_metadatas[source_idx]
+                target_meta = target_metadatas[int(k)]
+                source_text = source_texts[source_idx]
+                target_text = target_texts[int(k)]
 
-                for k in range(target_count):
-                    similarity = float(similarities[k])
-                    adjusted_sim = adjust_similarity(similarity)
-                    # 结果按 adjusted 三档分类 (与 DocScan 一致):
-                    # ≥0.8: 高度相似(几乎确定是重复)
-                    # 0.5-0.8: 中度相似(主题相近, 需要人工确认)
-                    # <0.5: 弱相关(语义有交叠但不算重复)
-                    if adjusted_sim >= 0.5:
-                        source_meta = source_metadatas[source_idx]
-                        target_meta = target_metadatas[k]
-                        source_text = source_texts[source_idx]
-                        target_text = target_texts[k]
+                # ★ B1: n-gram 合议 - 高向量但字面 overlap 极低的可能是
+                # boilerplate / 同领域不同内容, 不该自动列入"准备去重"。
+                # 这里逐对算 (query=source, target=target) 的字面信号。
+                text_overlap = text_ngram_overlap(source_text, target_text)
+                # 单文档内 longest_run (target 是单条 chunk, 直接用其 ngram set)
+                target_grams = build_ngram_index([target_text])
+                longest_run = longest_matching_run(source_text, target_grams)
 
-                        # ★ B1: n-gram 合议 — 高向量但字面 overlap 极低的可能是
-                        # boilerplate / 同领域不同内容, 不该自动列入"准备去重"。
-                        # 这里逐对算 (query=source, target=target) 的字面信号。
-                        text_overlap = text_ngram_overlap(source_text, target_text)
-                        # 单文档内 longest_run (target 是单条 chunk, 直接用其 ngram set)
-                        target_grams = build_ngram_index([target_text])
-                        longest_run = longest_matching_run(source_text, target_grams)
+                match_info = {
+                    "source_chunk_id": source_chunk_ids[source_idx] if source_chunk_ids else "",
+                    "source_text": source_text[:300],
+                    "target_text": target_text[:300],
+                    "source_parent_text": (source_meta.get("_parent_text") or "")[:300],
+                    "target_parent_text": (target_meta.get("_parent_text") or "")[:300],
+                    "similarity": similarity,
+                    "adjusted_similarity": adjusted_sim,
+                    "text_overlap": round(text_overlap, 4),
+                    "longest_run": longest_run,
+                    "source_metadata": source_meta,
+                    "target_metadata": target_meta,
+                }
+                all_matches.append(match_info)
 
-                        match_info = {
-                            "source_chunk_id": source_chunk_ids[source_idx] if source_chunk_ids else "",
-                            "source_text": source_text[:300],
-                            "target_text": target_text[:300],
-                            "source_parent_text": (source_meta.get("_parent_text") or "")[:300],
-                            "target_parent_text": (target_meta.get("_parent_text") or "")[:300],
-                            "similarity": similarity,
-                            "adjusted_similarity": adjusted_sim,
-                            "text_overlap": round(text_overlap, 4),
-                            "longest_run": longest_run,
-                            "source_metadata": source_meta,
-                            "target_metadata": target_meta,
-                        }
-                        all_matches.append(match_info)
-
-                        # 三档分桶 — B1: 高桶要求字面也支持 (overlap≥0.3 或 run≥30)
-                        # 否则降级为中等, 避免纯向量 boilerplate 被列入"准备去重"
-                        ngram_supports_high = (text_overlap >= 0.3 or longest_run >= 30)
-                        if adjusted_sim >= 0.8 and ngram_supports_high:
-                            result.high_similarity_count += 1
-                        elif adjusted_sim >= 0.65:
-                            result.medium_similarity_count += 1
-                        else:
-                            result.low_similarity_count += 1
+                # 三档分桶 - B1: 高桶要求字面也支持 (overlap≥0.3 或 run≥30)
+                # 否则降级为中等, 避免纯向量 boilerplate 被列入"准备去重"
+                ngram_supports_high = (text_overlap >= 0.3 or longest_run >= 30)
+                if adjusted_sim >= 0.8 and ngram_supports_high:
+                    result.high_similarity_count += 1
+                elif adjusted_sim >= 0.65:
+                    result.medium_similarity_count += 1
+                else:
+                    result.low_similarity_count += 1
 
             pair_completed += (batch_end - batch_start) * target_count
             total_completed = completed_before + pair_completed

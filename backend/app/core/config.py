@@ -63,6 +63,9 @@ class Settings(BaseSettings):
     API_KEY: str = ""
     AUTH_DISABLED: bool = False  # 必须显式 True 才能在 API_KEY 为空时绕过认证(仅限开发)
 
-    model_config = {"env_file": ".env", "case_sensitive": True}
+    # .env 用绝对路径而非相对 ".env": deploy/start.sh 从安装根目录用 --app-dir backend
+    # 启动 (CWD=安装根, 非 backend/), 相对 ".env" 会找不到 backend/.env, 导致 AUTH_DISABLED
+    # 取默认 False -> 认证中间件对每个请求抛 500 (浏览器显示 Internal Server Error)。
+    model_config = {"env_file": os.path.join(_BASE_DIR, "backend", ".env"), "case_sensitive": True}
 
 settings = Settings()

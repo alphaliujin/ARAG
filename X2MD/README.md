@@ -133,7 +133,7 @@ brew install tesseract tesseract-lang
 curl -fsSL https://ollama.com/install.sh | sh
 
 # 拉取模型
-ollama pull qwen2.5:7b
+ollama pull qwen3:14b
 ollama pull bge-m3  # 用于 AlphaRAG 向量化
 ```
 
@@ -228,11 +228,11 @@ encoding = utf-8                # 默认编码
 
 [llm]
 enabled = true                  # 是否启用 LLM
-model = qwen2.5:7b             # Ollama 模型名称
+model = qwen3:14b             # Ollama 模型名称
 base_url = http://localhost:11434  # Ollama 服务地址
 timeout = 120                   # 请求超时（秒）
 call_interval = 0.5             # 调用间隔（秒）
-max_concurrent = 4              # 最大并发数
+max_concurrent = 10             # 最大并发数
 
 [pdf]
 extract_tables = true           # 是否提取表格
@@ -287,11 +287,11 @@ inject_abstract = true          # 是否注入 LLM 摘要
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `enabled` | bool | `true` | 是否启用 LLM |
-| `model` | str | `qwen2.5:7b` | Ollama 模型名称 |
+| `model` | str | `qwen3:14b` | Ollama 模型名称 |
 | `base_url` | str | `http://localhost:11434` | Ollama API 地址 |
 | `timeout` | int | `120` | 请求超时时间（秒） |
 | `call_interval` | float | `0.5` | 连续调用间隔（秒） |
-| `max_concurrent` | int | `4` | 最大并发请求数 |
+| `max_concurrent` | int | `10` | 最大并发请求数 |
 
 **timeout 说明**：
 - 生成摘要时，模型需要加载和处理，首次调用可能较慢
@@ -798,7 +798,7 @@ ollama serve
 ollama list
 
 # 拉取模型
-ollama pull qwen2.5:7b
+ollama pull qwen3:14b
 ```
 
 #### 2. LLM 生成超时

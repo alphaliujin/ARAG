@@ -16,7 +16,18 @@ PID_FILE="$INSTALL_DIR/.server.pid"
 LOG="$INSTALL_DIR/server.log"
 
 cmd=${1:-start}
-check_port() { lsof -nP -i :"$1" -sTCP:LISTEN 2>/dev/null | grep -v COMMAND | awk '{print $2}' | head -1; }
+# 端口占用检测: 优先 lsof(macOS/部分Linux), 回退 ss(Ubuntu/DGX Spark 默认带 iproute2),
+# 再回退 fuser。DGX Spark 的 Ubuntu 最小安装常无 lsof, 没有 ss 回退会导致 stop/status 失效。
+check_port() {
+  local p="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -i :"$p" -sTCP:LISTEN 2>/dev/null | awk 'NR>1{print $2}' | head -1
+  elif command -v ss >/dev/null 2>&1; then
+    ss -ltnp 2>/dev/null | grep -E "[:.]$p " | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2
+  elif command -v fuser >/dev/null 2>&1; then
+    fuser "$p"/tcp 2>/dev/null | tr -s ' \t' '\n' | grep -E '^[0-9]+$' | head -1
+  fi
+}
 
 case "$cmd" in
   stop)

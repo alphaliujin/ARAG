@@ -14,11 +14,11 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
     },
     "llm": {
         "enabled": "true",
-        "model": "qwen2.5:7b-instruct",
+        "model": "qwen3:14b",
         "base_url": "http://localhost:11434",
         "timeout": "120",
         "call_interval": "0.5",
-        "max_concurrent": "4",
+        "max_concurrent": "10",
     },
     "pdf": {
         "extract_tables": "true",
@@ -37,6 +37,8 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
     "image": {
         "ocr_enabled": "true",
         "ocr_lang": "eng",
+        "ocr_engine": "paddleocr",
+        "ocr_paddle_model": "PP-OCRv6_medium",
     },
     "vit": {
         "enabled": "true",
@@ -159,7 +161,7 @@ class Config:
 
     @property
     def llm_model(self) -> str:
-        return self.get("llm", "model", "qwen2.5:7b-instruct")
+        return self.get("llm", "model", "qwen3:14b")
 
     @property
     def llm_base_url(self) -> str:
@@ -175,7 +177,7 @@ class Config:
 
     @property
     def llm_max_concurrent(self) -> int:
-        return int(self.get_raw("llm", "max_concurrent", "4"))
+        return int(self.get_raw("llm", "max_concurrent", "10"))
 
     def create_llm_client(self) -> OllamaClient | None:
         if not self.llm_enabled:

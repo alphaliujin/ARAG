@@ -439,9 +439,12 @@ async def get_status():
 async def reset_database():
     try:
         logger.info("[AUDIT] Delete operation: database reset (all collections cleared)")
-        # 委托给 ingestion_service（已封装 MD2RAG Indexer）
-        result = data_ingestion_service.reset_all()
-        data_ingestion_service.cleanup_memory()
+        # reset_all() 删除 ChromaDB 集合, cleanup_memory() 释放嵌入器缓存, 均为阻塞操作,
+        # 放到线程池避免卡住事件循环 (与 /ingest, /status 一致)。
+        result = await asyncio.to_thread(data_ingestion_service.reset_all)
+        # busy = 已有 reset 在跑, 本请求什么都没做; 跳过 cleanup, 避免与在跑的 reset 竞争 indexer 释放
+        if result.get("status") != "busy":
+            await asyncio.to_thread(data_ingestion_service.cleanup_memory)
         # 透传真实的 before/after 计数, 便于前端验证清空确实生效
         if result.get("status") == "error":
             logger.error(f"Reset operation returned error: {result.get('message')}")
@@ -509,15 +512,20 @@ async def scan_source_dir(level: str = Query(..., description="密级: 0Public, 
                 "files": []
             }
 
-        # 扫描文件
-        files = []
-        for f in source_dir.rglob("*"):
-            if f.is_file() and not f.name.startswith('.'):
-                files.append({
-                    "name": f.name,
-                    "path": str(f.relative_to(source_dir)),
-                    "size": f.stat().st_size,
-                })
+        # rglob + stat 是阻塞 I/O, 放到线程池避免卡住事件循环 (含 /health)。
+        # 与 /status 的 _compute 同理。
+        def _scan():
+            files = []
+            for f in source_dir.rglob("*"):
+                if f.is_file() and not f.name.startswith('.'):
+                    files.append({
+                        "name": f.name,
+                        "path": str(f.relative_to(source_dir)),
+                        "size": f.stat().st_size,
+                    })
+            return files
+
+        files = await asyncio.to_thread(_scan)
 
         return {
             "level": level,
@@ -873,10 +881,12 @@ async def start_ingest_task(request: TaskIngestRequest):
                 "message": "入库任务已在运行,请等待完成后再启动新任务"}
 
     # 更新嵌入模型设置 (支持 ollama-bge-m3 / mps-bge-m3)
+    # 嵌入模型切换 (支持 ollama-bge-m3 / mps-bge-m3)
+    # ★ 仅当传入模型与当前不同时才切换 (幂等): 相同模型直接入库, 不触发清库.
+    #   切换需 persist + 清库 (维度不一致) + 释放 indexer + 重建 vector_db embedding_fn,
+    #   否则入库/检索仍用旧模型. 此前只做内存赋值, 不持久化/不清库/不重建.
+    _switch_model = None
     if request.embedding_model:
-        # 复用 settings_service 白名单校验, 防止任意值污染全局 settings:
-        # 此前直接赋值会绕过 _ALLOWED_EMBEDDING_MODELS 校验, 传入 "chromadb-default"
-        # 等值会导致维度不一致/向量损坏, 且重启前不恢复。
         from app.services.settings_service import settings_service
         if request.embedding_model not in settings_service._ALLOWED_EMBEDDING_MODELS:
             raise HTTPException(
@@ -884,7 +894,8 @@ async def start_ingest_task(request: TaskIngestRequest):
                 detail=f"Invalid embedding_model: {request.embedding_model}. "
                        f"Allowed: {list(settings_service._ALLOWED_EMBEDDING_MODELS)}",
             )
-        settings.EMBEDDING_MODEL = request.embedding_model
+        if request.embedding_model != settings.EMBEDDING_MODEL:
+            _switch_model = request.embedding_model
 
     # Validate classification BEFORE creating the task (client gets 400, not hidden error)
     if request.classification and request.classification not in VALID_CLASSIFICATIONS:
@@ -894,6 +905,10 @@ async def start_ingest_task(request: TaskIngestRequest):
 
     def _run():
         callback = task_manager.make_progress_callback(task_id)
+        # 切模型 (若请求): persist + 清库 + 释放 indexer + 重建兜底 embedding_fn.
+        # reset 是阻塞 IO, 放后台线程不卡 HTTP; 失败则任务 failed, 不混入旧维度向量.
+        if _switch_model:
+            data_ingestion_service.switch_embedding_model(_switch_model)
         info = task_manager.get_task(task_id)
         cancel_evt = info.cancel_event if info else None
         if request.classification:

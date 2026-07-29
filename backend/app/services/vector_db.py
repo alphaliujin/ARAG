@@ -430,6 +430,19 @@ class VectorDBService:
         except Exception as e:
             print(f"Error clearing collection {name}: {e}")
 
+    def rebuild_embedding_fn(self):
+        """重建 embedding_fn 并重开 collection 缓存 (不删除已有数据).
+
+        切换嵌入模型后调用: 让兜底检索的 embedder 与新 settings.EMBEDDING_MODEL 一致.
+        调用方须自行确保旧向量已清空 (不同模型维度不一致会致检索错乱),
+        否则应改用 reset_all().
+        """
+        with self._init_lock:
+            self._initialized = False
+            with self._collection_lock:
+                self._collections.clear()
+        self.initialize()
+
     def reset_all(self):
         if not self.client:
             return

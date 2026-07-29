@@ -9,7 +9,8 @@ X2MD 当前生成的 .parents.json/.children.json 中 bbox 字段为空字符串
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import bisect
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from md2rag.logger import get_logger
@@ -25,6 +26,45 @@ class LineInfo:
     char_end: int         # 在全文中的字符结束位置
     text: str             # 行内容
     bbox: Tuple[float, float, float, float]  # [x0, y0, x1, y1] 伪坐标
+
+
+@dataclass
+class LineIndex:
+    """一个文件全文的行级索引, 用于加速 bbox 关联.
+
+    make_synthetic_bboxes 产出的 line_infos 本身就按 char_start 升序
+    (char_pos 单调累加), char_end 非降。本结构额外缓存排序好的
+    char_starts / char_ends 数组, 使 assign_bboxes_to_chunk 可用二分
+    在 O(log 行数 + 命中数) 内完成, 而非每个 chunk 都 O(行数) 扫一遍。
+
+    一个文件的 MD 原文可能被上万 chunk 共享: 旧实现每条 chunk 都重新
+    make_synthetic_bboxes + 线性扫描, 遇到大文件 (数万行 × 数万 chunk)
+    会成为 CPU 瓶颈并长期占用 GIL, 拖垮 asyncio 端点。本索引每文件算
+    一次, 通过 get_bboxes_for_record(line_index=...) 传入。
+    """
+    line_infos: List[LineInfo]
+    char_starts: List[int] = field(default_factory=list)  # 升序
+    char_ends: List[int] = field(default_factory=list)    # 非降
+
+
+def build_line_index(source_text: str) -> LineIndex:
+    """为一份 MD 原文构建行级索引 (每文件调用一次, 复用给该文件所有 chunk).
+
+    等价于 make_synthetic_bboxes + 预取 char_starts/char_ends, 供
+    assign_bboxes_to_chunk 二分查找使用。
+
+    Args:
+        source_text: 完整 MD 原文
+
+    Returns:
+        LineIndex: line_infos + 排序好的 char_starts/char_ends
+    """
+    line_infos = make_synthetic_bboxes(source_text)
+    return LineIndex(
+        line_infos=line_infos,
+        char_starts=[li.char_start for li in line_infos],
+        char_ends=[li.char_end for li in line_infos],
+    )
 
 
 def make_synthetic_bboxes(
@@ -93,13 +133,18 @@ def assign_bboxes_to_chunk(
     chunk_text: str,
     chunk_char_start: int,
     line_infos: List[LineInfo],
+    char_starts: Optional[List[int]] = None,
+    char_ends: Optional[List[int]] = None,
 ) -> List[Dict[str, Any]]:
     """根据 chunk 在原文中的字符位置，关联 bbox 信息.
 
     Args:
         chunk_text: chunk 文本
         chunk_char_start: chunk 在原文中的字符起始位置
-        line_infos: 全文的行级 bbox 信息
+        line_infos: 全文的行级 bbox 信息 (按 char_start 升序)
+        char_starts: 可选, line_infos 的 char_start 升序数组 (来自 build_line_index).
+            传入时启用 O(log 行数) 二分路径; 不传则回退 O(行数) 线性扫描。
+        char_ends: 可选, 对应 char_end 非降数组, 与 char_starts 配套使用。
 
     Returns:
         [{"page": int, "bbox": [x0,y0,x1,y1], "line_no": int}, ...]
@@ -107,14 +152,31 @@ def assign_bboxes_to_chunk(
     chunk_char_end = chunk_char_start + len(chunk_text)
     related: List[Dict[str, Any]] = []
 
-    for line in line_infos:
-        # 行与 chunk 有重叠
-        if line.char_end > chunk_char_start and line.char_start < chunk_char_end:
+    if char_starts is not None and char_ends is not None:
+        # 二分路径: 行与 chunk 重叠的充要条件是
+        #   line.char_end > chunk_char_start  AND  line.char_start < chunk_char_end
+        # -> lo = 第一个 char_end > chunk_char_start 的行
+        # -> hi = 第一个 char_start >= chunk_char_end 的行
+        # 命中区即 [lo, hi)。char_starts 严格升序 / char_ends 非降, bisect 合法。
+        lo = bisect.bisect_right(char_ends, chunk_char_start)
+        hi = bisect.bisect_left(char_starts, chunk_char_end)
+        for i in range(lo, hi):
+            line = line_infos[i]
             related.append({
-                "page": _line_to_page(line.line_no),  # 与 make_synthetic_bboxes 用同一 lines_per_page
+                "page": _line_to_page(line.line_no),
                 "bbox": list(line.bbox),
                 "line_no": line.line_no,
             })
+    else:
+        # 兼容路径: 旧调用方 / 测试直接传 line_infos
+        for line in line_infos:
+            # 行与 chunk 有重叠
+            if line.char_end > chunk_char_start and line.char_start < chunk_char_end:
+                related.append({
+                    "page": _line_to_page(line.line_no),  # 与 make_synthetic_bboxes 用同一 lines_per_page
+                    "bbox": list(line.bbox),
+                    "line_no": line.line_no,
+                })
 
     if not related:
         # 兜底：找不到时返回空列表
@@ -127,6 +189,7 @@ def get_bboxes_for_record(
     record_text: str,
     source_text: str,
     record_char_start: Optional[int] = None,
+    line_index: Optional[LineIndex] = None,
 ) -> List[Dict[str, Any]]:
     """为一条 chunk 记录生成 bbox 列表.
 
@@ -134,6 +197,9 @@ def get_bboxes_for_record(
         record_text: chunk 文本
         source_text: 完整 MD 原文
         record_char_start: chunk 在 source_text 中的起始位置（None 时自动搜索）
+        line_index: 可选, 预构建的全文行级索引 (build_line_index), 复用给同文件
+            的所有 chunk。传入时跳过 make_synthetic_bboxes 重建并走二分路径,
+            避免每个 chunk 都 O(行数) 扫描。不传则按旧行为每次重建。
 
     Returns:
         bbox 列表
@@ -147,6 +213,15 @@ def get_bboxes_for_record(
         if pos == -1:
             return []
         record_char_start = pos
+
+    if line_index is not None:
+        return assign_bboxes_to_chunk(
+            record_text,
+            record_char_start,
+            line_index.line_infos,
+            char_starts=line_index.char_starts,
+            char_ends=line_index.char_ends,
+        )
 
     line_infos = make_synthetic_bboxes(source_text)
     return assign_bboxes_to_chunk(record_text, record_char_start, line_infos)

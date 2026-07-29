@@ -111,7 +111,7 @@ batch_size = 32
 [ollama]
 enabled = false
 base_url = http://localhost:11434
-model = qwen2.5:7b
+model = qwen3:14b
 
 [sentence_transformers]
 enabled = false

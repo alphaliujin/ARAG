@@ -76,6 +76,11 @@ def get_logger(name: str) -> logging.Logger:
         if file_handler:
             logger.addHandler(file_handler)
         logger.addHandler(console_handler)
+        # 关闭向上传播: 本模块给每个 md2rag.* logger 都挂了 handler,
+        # 若 propagate=True, 子 logger(如 md2rag.loader)的记录会再传给
+        # 同样挂了 handler 的根 md2rag logger, 导致每条日志输出两次
+        # (stdout 与 MD2RAG.log 各翻倍)。挂 handler 的 logger 不再传播即可。
+        logger.propagate = False
         _registered.add(name)
 
     return logger

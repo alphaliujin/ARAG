@@ -152,8 +152,14 @@ class PreprocessService:
                 })
 
             try:
-                # 构建输出路径
-                output_path = output_dir / f"{file_path.stem}.md"
+                # 构建输出路径 - 保留相对子目录结构,避免不同子目录下同名(同 stem)
+                # 文件的输出互相覆盖。file_path 来自 source_dir.rglob,必在 source_dir 下;
+                # X2MD _convert_file 会对 out_path.parent 做 mkdir(parents=True),嵌套目录自动创建。
+                try:
+                    rel = file_path.relative_to(source_dir)
+                    output_path = output_dir / rel.with_suffix(".md")
+                except ValueError:
+                    output_path = output_dir / f"{file_path.stem}.md"
 
                 # 使用 wrapper 脚本方式调用 X2MD,避免 python3 -c f-string 命令注入
                 # 将 sys.path 和参数通过环境变量/命令行参数传递,不再拼接 Python 代码字符串
@@ -458,7 +464,13 @@ class PreprocessService:
                 })
                 continue
 
-            output_path = output_dir / f"{source_file.stem}.md"
+            # 保留相对子目录结构,避免同名文件互相覆盖 (与 process_level 一致)。
+            # source_file 来自 source_dir.rglob,必在 source_dir 下。
+            try:
+                rel = source_file.relative_to(source_dir)
+                output_path = output_dir / rel.with_suffix(".md")
+            except ValueError:
+                output_path = output_dir / f"{source_file.stem}.md"
             x2md_src = base_dir / 'X2MD' / 'src'
             cmd = [
                 sys.executable,

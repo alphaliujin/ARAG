@@ -30,9 +30,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from md2rag.bbox_extractor import get_bboxes_for_record
+from md2rag.bbox_extractor import build_line_index, get_bboxes_for_record
 from md2rag.config import MD2RAGConfig, load_config
 from md2rag.embedder import Embedder, create_embedder
+from md2rag.embedding_cache import IndexManifest
 from md2rag.image_processor import ImageProcessor, ViTImageEmbedder
 from md2rag.llm_summary import LLMClient, extract_abstract
 from md2rag.loader import (
@@ -60,7 +61,7 @@ logger = get_logger("md2rag.indexer")
 # BATCH_SIZE_FILES 控制外层文件批 — 单文件已经是流式入库, 这里只决定多久打一次
 # RSS 日志/清理. 设小一点有助于在大文件密集时及时回收.
 BATCH_SIZE_FILES = 5
-BATCH_SIZE_EMBED = 32          # 每批嵌入文本数 — 与 MPSEmbedder.batch_size 配合
+BATCH_SIZE_EMBED = 128         # 每批嵌入文本数 - 2026-07-23 实测大批更快 (见 embedder._call_batch 注释)
 BATCH_SIZE_IMAGES = 8          # 图片单批数 — ViT-Large peak 内存大, 不宜过大
 MEMORY_CLEANUP_INTERVAL = 1    # 每批文件都清一次 (旧值 5, 大文件下太稀疏)
 
@@ -155,6 +156,10 @@ class Indexer:
             collection_prefix=self.config.collection_prefix,
         )
 
+        # 增量索引清单: 记录已成功 embed+upsert 的 chunk 文件 (path+content_hash)。
+        # 重跑时跳过未变文件, 省 embed + ChromaDB upsert; 清库时联动 clear。
+        self._manifest = IndexManifest(self.config.vector_db_dir / "md2rag_index_manifest.sqlite")
+
         # Per-classification 父子检索器缓存
         self._retrievers: Dict[str, ParentChildRetriever] = {}
 
@@ -189,6 +194,7 @@ class Indexer:
                 model_type="ollama",
                 ollama_url=self.config.ollama_base_url,
                 ollama_model=self.config.ollama_model,
+                ollama_cache_path=str(self.config.vector_db_dir / "md2rag_embedding_cache.sqlite"),
             )
         if self.config.st_enabled:
             return create_embedder(
@@ -232,6 +238,7 @@ class Indexer:
             model_type=model_type,
             ollama_url=self.config.ollama_base_url,
             device=self.config.device,
+            ollama_cache_path=str(self.config.vector_db_dir / "md2rag_embedding_cache.sqlite") if model_type == "ollama" else None,
             **kwargs,
         )
         new_dim = new_embedder.dimension
@@ -244,6 +251,7 @@ class Indexer:
         self.store.embedder = new_embedder
         self._current_embedder_name = embedding_model
         self._retrievers.clear()  # 重建
+        self._manifest.clear()  # 换了 embedder, "已索引"记录失效, 下次重嵌 (同维度换模型也必须重嵌, 否则留旧模型向量)
         logger.info(f"[SWITCH] Embedder switched to {embedding_model}, dim={new_dim}")
 
     def _get_retriever(self, classification: str) -> ParentChildRetriever:
@@ -519,13 +527,25 @@ class Indexer:
 
             # ★ 加载当前批次的文件（而非全部文件）
             batch_records: List[Tuple[Path, List[ChunkRecord]]] = []
+            skipped_in_batch = 0
             for fp in batch_files:
+                # 增量跳过: 内容未变且非重生成摘要 -> 直接跳过 (省 load + embed + upsert)
+                if not regenerate_abstract:
+                    try:
+                        fp_hash = IndexManifest.file_hash(fp)
+                        if self._manifest.is_done(str(fp), fp_hash):
+                            skipped_in_batch += 1
+                            continue
+                    except Exception as e:
+                        logger.warning(f"[SKIP_CHECK] hash/manifest check failed for {fp}: {e}")
                 try:
                     records = self.loader.load_file(fp)
                     if records:
                         batch_records.append((fp, records))
                 except Exception as e:
                     logger.error(f"[LOAD_ERROR] Failed to load {fp}: {e}")
+            if skipped_in_batch:
+                logger.info(f"[INDEX] batch{batch_idx}/{total_batches}: skipped {skipped_in_batch} unchanged file(s)")
 
             if not batch_records:
                 continue
@@ -579,6 +599,11 @@ class Indexer:
                 )
                 parents_total += p
                 children_total += c
+                # 成功 (embed+upsert 全过) 才记 manifest -> 下次跳过; 异常不记 -> 重试
+                try:
+                    self._manifest.mark_done(str(file_path), IndexManifest.file_hash(file_path), classification)
+                except Exception as me:
+                    logger.warning(f"[MANIFEST] mark_done failed for {file_path}: {me}")
             except Exception as e:
                 logger.error(f"[INDEX] Failed processing file {file_path}: {e}", exc_info=True)
             finally:
@@ -610,6 +635,10 @@ class Indexer:
             except Exception as e:
                 logger.warning(f"[INDEX] Failed to read MD {md_path}: {e}")
 
+        # 行级索引每文件构建一次, 复用给本文件所有 parent/child,
+        # 避免旧实现每条 chunk 都 make_synthetic_bboxes + 线性扫描 (大文件 CPU 瓶颈).
+        line_index = build_line_index(source_text) if source_text else None
+
         # 构造轻量 embed items (不持 ChunkRecord 引用)
         embed_items: List[Dict[str, Any]] = []
 
@@ -619,7 +648,7 @@ class Indexer:
                 if new_abs:
                     p.abstract = new_abs
             if not p.bbox and source_text:
-                bboxes = get_bboxes_for_record(p.text, source_text)
+                bboxes = get_bboxes_for_record(p.text, source_text, line_index=line_index)
                 if bboxes:
                     p.bbox = str(bboxes)
             meta = p.to_metadata(classification, str(file_path))
@@ -639,7 +668,7 @@ class Indexer:
                 if new_abs:
                     c.abstract = new_abs
             if not c.bbox and source_text:
-                bboxes = get_bboxes_for_record(c.text, source_text)
+                bboxes = get_bboxes_for_record(c.text, source_text, line_index=line_index)
                 if bboxes:
                     c.bbox = str(bboxes)
             meta = c.to_metadata(classification, str(file_path))
@@ -966,6 +995,7 @@ class Indexer:
                     logger.warning(f"[CLEAR] Failed to delete {name}: {e}")
                 self.store._collections.pop(name, None)
             self._retrievers.pop(classification, None)
+            self._manifest.clear(classification)
         else:
             try:
                 client = self.store._get_client()
@@ -995,3 +1025,4 @@ class Indexer:
             logger.info(f"[CLEAR] All-clear done: {deleted} deleted, {failed} failed")
             self._retrievers.clear()
             self.store._collections.clear()
+            self._manifest.clear()

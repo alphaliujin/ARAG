@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import gc
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -35,6 +36,9 @@ class DataIngestionService:
         self._indexer = None
         self._md2rag_config = None
         self._use_v2 = True  # 默认使用 V2 分批版本
+        # 防 reset 并发 (双击 / 清空+切换模型 同时触发): 非阻塞获取,
+        # 抢不到说明已有 reset 在跑, 直接返回 status="busy" 而非报错/partial。
+        self._reset_lock = threading.Lock()
 
     def _get_indexer(self):
         """延迟初始化 MD2RAG Indexer (V2 分批版本)."""
@@ -87,9 +91,15 @@ class DataIngestionService:
         return cfg
 
     def estimate_records(self, classification_level: str) -> Dict[str, Any]:
-        """预估入库时间和记录条数.
+        """预估入库时间和待入库文档数.
 
-        通过 MD2RAG 的 ChunkLoader 发现文件.
+        通过 MD2RAG 的 ChunkLoader 发现切片文件, 按文档 (切片 json 内的
+        metadata.source, 即入库写入 ChromaDB 的同一字段) 去重, 并排除已入库
+        文档后返回 "待入库" 数量.
+
+        file_count 语义为 "待入库文档数" (已排除已入库), 不是切片文件数:
+        父子块模式下每个文档贡献 parents+children 两个切片文件, 直接数切片文件
+        会把文档数翻倍, 故改为按 source 聚合.
         """
         try:
             from md2rag.loader import CLASSIFICATION_DIR_MAP, ChunkLoader
@@ -105,18 +115,27 @@ class DataIngestionService:
                     "classification_level": classification_level,
                     "estimated_records": 0,
                     "file_count": 0,
+                    "total_documents": 0,
+                    "indexed_documents": 0,
+                    "pending_documents": 0,
                     "estimated_time_seconds": 0,
                     "message": f"Directory does not exist: {dir_path}",
                 }
 
             loader = ChunkLoader(settings.DATA_DIR)
             files = loader.discover_files(classification_level)
-            estimated_records = 0
+
+            indexed_sources = self._get_indexed_sources(classification_level)
+
+            doc_sources: set = set()
+            src_sizes: Dict[str, int] = {}
             files_info = []
             for f in files:
                 size = f.stat().st_size
-                # 粗略估算: 1000 字节约 1 chunk
-                estimated_records += max(1, size // 1000)
+                src = self._source_from_path(f)
+                if src:
+                    doc_sources.add(src)
+                    src_sizes[src] = src_sizes.get(src, 0) + size
                 files_info.append({
                     "name": f.name,
                     "path": str(f),
@@ -124,19 +143,58 @@ class DataIngestionService:
                     "type": f.suffixes[-2] if len(f.suffixes) > 1 else "",
                 })
 
-            estimated_time = estimated_records * 0.1 + len(files_info) * 0.5
+            total_documents = len(doc_sources)
+            pending_sources = doc_sources - indexed_sources
+            indexed_documents = total_documents - len(pending_sources)
+            # 粗略估算: 1000 字节约 1 chunk; 只累计待入库文档, 避免把已入库也算进去
+            estimated_records = sum(
+                max(1, sz // 1000)
+                for src, sz in src_sizes.items()
+                if src in pending_sources
+            )
+            estimated_time = estimated_records * 0.1 + len(pending_sources) * 0.5
             return {
                 "status": "estimated",
                 "classification_level": classification_level,
                 "estimated_records": estimated_records,
-                "file_count": len(files_info),
+                "file_count": len(pending_sources),
+                "total_documents": total_documents,
+                "indexed_documents": indexed_documents,
+                "pending_documents": len(pending_sources),
                 "estimated_time_seconds": estimated_time,
                 "estimated_time_formatted": self._format_time(estimated_time),
                 "files": files_info,
-                "message": f"预估记录数: {estimated_records}, 文件数: {len(files_info)}",
+                "message": (
+                    f"待入库文档: {len(pending_sources)}/{total_documents}, "
+                    f"切片文件: {len(files_info)}"
+                ),
             }
         except Exception as e:
             return {"error": str(e)}
+
+    @staticmethod
+    def _source_from_path(file_path) -> Optional[str]:
+        """从切片文件名推导文档 source (与入库 metadata.source 同口径).
+
+        切片文件命名为 <source>.{parents,children,chunks}.json, 其中 <source>
+        即入库写入 ChromaDB 的 source 字段 (parents/chunks/children 共享同一值).
+        从文件名反推可避免逐个 json.load —— 大库 (2.7w+ 切片文件) 读一遍要 ~80s,
+        不可接受; 文件名推导与 stat 同级开销.
+        """
+        name = Path(file_path).name
+        for suf in (".parents.json", ".children.json", ".chunks.json"):
+            if name.endswith(suf):
+                return name[:-len(suf)]
+        return None
+
+    def _collect_doc_sources(self, files) -> set:
+        """从切片文件聚合文档身份 (source) 集合, 用于入库去重预检."""
+        sources: set = set()
+        for f in files:
+            src = self._read_source(f)
+            if src:
+                sources.add(src)
+        return sources
 
     def _get_indexed_sources(self, classification_level: str) -> set:
         """查 SQLite 拿该密级下已索引的 source 文件路径集合.
@@ -197,13 +255,16 @@ class DataIngestionService:
             Dict: 入库结果. 全部已入库时 status='skipped', 此时不调 MD2RAG.
         """
         try:
-            # 去重预检 (P2-3): 已入库文件不再 embed
+            # 去重预检 (P2-3): 已入库文档不再 embed
             if not force:
                 try:
                     from md2rag.loader import ChunkLoader
                     loader = ChunkLoader(settings.DATA_DIR)
                     discovered = loader.discover_files(classification_level) or []
-                    discovered_sources = {str(p) for p in discovered}
+                    # 用切片 json 内的 metadata.source 聚合文档身份 (与入库写入
+                    # ChromaDB 的 source 字段同口径); 此前用 str(path) 完整路径与
+                    # _get_indexed_sources 返回的裸名对不上, 交集恒空 -> 短路永不触发.
+                    discovered_sources = self._collect_doc_sources(discovered)
                     indexed_sources = self._get_indexed_sources(classification_level)
                     new_sources = discovered_sources - indexed_sources
                     overlapping = discovered_sources & indexed_sources
@@ -211,7 +272,7 @@ class DataIngestionService:
                     if discovered_sources and not new_sources:
                         # 100% 已入库, 短路返回, 不浪费 embed 时间
                         msg = (
-                            f"全部 {len(discovered_sources)} 个源文件均已入库, "
+                            f"全部 {len(discovered_sources)} 个文档均已入库, "
                             f"跳过 (传 force=True 可强制重入)"
                         )
                         if progress_callback:
@@ -239,7 +300,7 @@ class DataIngestionService:
                         # 部分新增、部分已入: 仍跑 MD2RAG, 由 ChromaDB ID 冲突吞掉旧的
                         # (理想方案是只传 new_sources 给 MD2RAG, 但需改其私有 API)
                         print(
-                            f"[INGEST] {classification_level}: {len(new_sources)} 新增文件, "
+                            f"[INGEST] {classification_level}: {len(new_sources)} 新增文档, "
                             f"{len(overlapping)} 已存在 (将由 ChromaDB ID 冲突跳过)"
                         )
                 except Exception as e:
@@ -477,13 +538,48 @@ class DataIngestionService:
                     "total_vectors": 0,
                 }
 
+    def switch_embedding_model(self, new_model: str) -> Dict[str, Any]:
+        """切换嵌入模型并保证两套 embedder 与向量库一致.
+
+        切模型时向量维度/语义改变, 必须: 持久化新模型 + 清空旧向量 + 释放旧 indexer
+        (下次 _get_indexer 按新模型重建) + 重建 backend 兜底 embedding_fn.
+        缺任一步都会导致入库或检索仍用旧模型, 维度混用致结果错乱.
+
+        此前 start_ingest_task 仅做 settings.EMBEDDING_MODEL = new_model 内存赋值,
+        不持久化 (重启丢) / 不清库 / 不重建 embedder, 是模型切换 bug 的根因.
+        """
+        from app.services.settings_service import settings_service
+
+        # 1) 持久化 + 应用到 settings (settings_service 校验白名单并 _apply_runtime_settings)
+        settings_service.update_category("model", {"embeddingModel": new_model})
+
+        # 2) 清空 MD2RAG collection + 释放旧 indexer (下次 _get_indexer 按新模型重建)
+        res = self.reset_all()
+        if res.get("status") in ("error", "busy"):
+            raise RuntimeError(f"切换模型清库失败: {res.get('message')}")
+
+        # 3) 重建 backend 兜底 embedding_fn + 清失效 collection 缓存 (不重复删数据)
+        vector_db_service.rebuild_embedding_fn()
+        return {"switched_to": new_model, "reset": res}
+
     def reset_all(self):
         """重置所有 collection + 清理物理残留.
 
-        1) 记 before, 调 indexer.clear() 全清
-        2) 兜底: 枚举删除残留 collection
-        3) 物理清理: 删除 ChromaDB HNSW UUID 目录 + SQLite VACUUM
+        1) 互斥: 同一时刻只允许一个 reset (防双击/多路径并发 -> 竞态误报 error/partial)
+        2) 记 before, 调 indexer.clear() 全清
+        3) 兜底: 枚举删除残留 collection
+        4) 物理清理: 删除 ChromaDB HNSW UUID 目录 + SQLite VACUUM
+        5) 以清理后的最终计数判定 success/partial (中途 after 在并发/事务延迟下可能读到陈旧 >0)
         """
+        # 互斥: 非阻塞获取。并发 reset (双击 / 清空+切换模型 同时触发) 直接返回 busy,
+        # 不抛异常也不报 partial, 让前端按 status="busy" 友好提示, 避免假"失败"。
+        if not self._reset_lock.acquire(blocking=False):
+            return {
+                "status": "busy",
+                "message": "Reset already in progress, please wait",
+                "vectors_before": None,
+                "vectors_after": None,
+            }
         try:
             before = self.get_database_stats().get("total_vectors", -1)
             indexer = self._get_indexer()
@@ -501,14 +597,21 @@ class DataIngestionService:
             # 这些残留不影响功能但浪费磁盘, 在 reset 时一并清除。
             self._physical_cleanup()
 
+            # 以物理清理完成后的最终计数为准: 此前的 after 在并发/事务提交延迟下
+            # 可能读到陈旧 >0 (历史假"partial"的根因)。clear()+purge+cleanup 已尽力清空,
+            # 这重查一次拿到确定结果。
+            final = self.get_database_stats().get("total_vectors", -1)
+
             return {
-                "status": "success" if after == 0 else "partial",
-                "message": f"Reset: {before} → {after} vectors",
+                "status": "success" if final == 0 else "partial",
+                "message": f"Reset: {before} -> {final} vectors",
                 "vectors_before": before,
-                "vectors_after": after,
+                "vectors_after": final,
             }
         except Exception as e:
             return {"status": "error", "message": str(e)}
+        finally:
+            self._reset_lock.release()
 
     def _force_purge_remaining(self) -> None:
         """兜底: 用裸 ChromaDB client 枚举并删除所有残留 collection."""

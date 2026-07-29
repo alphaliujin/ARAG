@@ -15,6 +15,7 @@ from typing import Any, Optional
 import numpy as np
 
 from md2rag.logger import get_logger, log_step, log_timing
+from md2rag.embedding_cache import EmbeddingCache
 
 logger = get_logger("md2rag.embedder")
 
@@ -147,6 +148,7 @@ class OllamaEmbedder(Embedder):
         max_concurrent: int = 4,
         max_retries: int = 3,
         retry_delay: float = 1.0,
+        cache_path: Optional[str | Path] = None,
     ):
         log_step(logger, "INIT", f"Initializing OllamaEmbedder (model={model})...")
         self.base_url = base_url.rstrip("/")
@@ -161,6 +163,15 @@ class OllamaEmbedder(Embedder):
         # 容量上限防止长跑 OOM。
         self._cache: dict[str, list[float]] = {}
         self._cache_max = 5000
+        # 磁盘持久缓存 (SQLite): 进程重启后仍命中, 省 Ollama 调用 (生成向量是入库瓶颈)。
+        # None 时退化为纯内存 (旧行为)。key 含 model 名 -> 换模型自动 miss, 无需手动失效。
+        self._disk_cache: Optional[EmbeddingCache] = None
+        if cache_path is not None:
+            try:
+                self._disk_cache = EmbeddingCache(cache_path)
+            except Exception as e:
+                logger.warning(f"[INIT] disk cache init failed (fallback to memory-only): {e}")
+                self._disk_cache = None
         # urllib.request.OpenerDirector 不是线程安全的;旧实现共享一个 opener,
         # 在 ThreadPoolExecutor.map 中可能损坏内部 handler 状态。
         # 改为每次 HTTP 调用本地构造,这样 urlopen 路径完全无共享状态。
@@ -174,6 +185,9 @@ class OllamaEmbedder(Embedder):
         payload = json.dumps({
             "model": self.model,
             "prompt": text,
+            # keep_alive: 入库几十分钟内不让 bge-m3 卸载, 避免重载时的设备重评估
+            # (GB10 统一内存上重载可能触发 CPU 计算路径, 导致 embed 变慢)
+            "keep_alive": "30m",
         }).encode("utf-8")
         req = urllib.request.Request(
             f"{self.base_url}/api/embeddings",
@@ -234,7 +248,11 @@ class OllamaEmbedder(Embedder):
         长文档总耗时靠前端 30 分钟超时兜底完成(~3453 chunk ≈ 14 分钟)。
         若 Ollama 侧设置了 OLLAMA_NUM_PARALLEL>1 真正并行, 再考虑恢复并发。
         """
-        batch_size = 100
+        # 128 (2026-07-23 实测调回大批): GB10+CUDA+当前 Ollama 上, 长/短文本大批均更快
+        # (短 71->108 t/s, 长 16->24 t/s, 256 文本基准), 未复现早年 Metal 上 batch=100
+        # 长文本触发 CPU 计算路径 (GPU-Util=0) 的问题 - 疑似旧 Ollama/Metal 后端 bug。
+        # 若日志再现 "embed 1-5s vs 正常 600ms" 的 CPU 路径, 再降回 32。
+        batch_size = 128
         all_embeddings: list[list[float]] = []
 
         for batch_start in range(0, len(texts), batch_size):
@@ -253,6 +271,7 @@ class OllamaEmbedder(Embedder):
         payload = json.dumps({
             "model": self.model,
             "input": texts,
+            "keep_alive": "30m",
         }).encode("utf-8")
         req = urllib.request.Request(
             f"{self.base_url}/api/embed",
@@ -355,13 +374,39 @@ class OllamaEmbedder(Embedder):
                 missing_texts.append(t)
 
         if missing_texts:
-            embeddings = self._call_ollama(missing_texts)
-            # 归一化: Ollama bge-m3 返回原始向量模长≈26;
-            # ChromaDB 1-d²/2=cosine 公式仅在 norm=1 时成立
-            normalized = _l2_normalize_list(embeddings)
-            for slot, emb in zip(missing_idx, normalized):
-                result[slot] = emb
-                self._cache_put(texts[slot], emb)
+            # 三级缓存第二级: 磁盘 SQLite (进程重启后仍命中, 省 Ollama 调用)
+            still_idx: list[int] = []
+            still_texts: list[str] = []
+            if self._disk_cache is not None:
+                keys = [self._cache_key(t) for t in missing_texts]
+                disk_hits = self._disk_cache.get_many(keys)
+                for slot, t in zip(missing_idx, missing_texts):
+                    hit = disk_hits.get(self._cache_key(t))
+                    if hit is not None:
+                        result[slot] = hit
+                        self._cache_put(t, hit)  # 回填内存 LRU
+                    else:
+                        still_idx.append(slot)
+                        still_texts.append(t)
+            else:
+                still_idx, still_texts = missing_idx, missing_texts
+
+            if still_texts:
+                embeddings = self._call_ollama(still_texts)
+                # 归一化: Ollama bge-m3 返回原始向量模长≈26;
+                # ChromaDB 1-d²/2=cosine 公式仅在 norm=1 时成立
+                normalized = _l2_normalize_list(embeddings)
+                new_items: list[tuple[str, str, int, list[float]]] = []
+                for slot, emb in zip(still_idx, normalized):
+                    result[slot] = emb
+                    self._cache_put(texts[slot], emb)
+                    if self._disk_cache is not None and emb:
+                        new_items.append((self._cache_key(texts[slot]), self.model, len(emb), emb))
+                if self._disk_cache is not None and new_items:
+                    try:
+                        self._disk_cache.put_many(new_items)
+                    except Exception as e:
+                        logger.warning(f"[OLLAMA] disk cache write failed (non-fatal): {e}")
 
         return [r if r is not None else [] for r in result]
 
@@ -390,6 +435,9 @@ class OllamaEmbedder(Embedder):
         # cache (sha256 → embedding, 上限 5000 条). 长跑入库会让该 cache 单调
         # 增长到上限 (5000 × 1024 × 4B ≈ 20MB), 多个密级累计常驻; release 时清空。
         self._cache.clear()
+        if self._disk_cache is not None:
+            self._disk_cache.close()
+            self._disk_cache = None
 
 
 class SentenceTransformerEmbedder(Embedder):
@@ -703,6 +751,7 @@ def create_embedder(
     ollama_concurrent: int = 4,
     st_model: str = "all-MiniLM-L6-v2",
     device: str = "cpu",
+    ollama_cache_path: Optional[str | Path] = None,
 ) -> Embedder:
     """工厂函数：根据类型创建嵌入模型.
 
@@ -727,6 +776,7 @@ def create_embedder(
             base_url=ollama_url,
             model=ollama_model,
             max_concurrent=ollama_concurrent,
+            cache_path=ollama_cache_path,
         )
     elif model_type in ("sentence-transformer", "sentence-transformers", "st"):
         return SentenceTransformerEmbedder(model_name=st_model, device=device)
