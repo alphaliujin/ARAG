@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>文本扫描工作流程图</title>
+<style>
+  :root{
+    --bg:#f8fafc; --ink:#0f172a; --muted:#475569; --line:#94a3b8;
+    --start:#dcfce7; --start-b:#16a34a;
+    --end:#ede9fe; --end-b:#7c3aed;
+    --proc:#eff6ff; --proc-b:#2563eb;
+    --dec:#fff7ed; --dec-b:#ea580c;
+    --para:#fef9c3; --para-b:#ca8a04;
+    --note:#f1f5f9; --note-b:#64748b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",Segoe UI,Roboto,sans-serif;
+    line-height:1.55;padding:28px 16px 60px}
+  .wrap{max-width:760px;margin:0 auto}
+  h1{font-size:22px;margin:0 0 4px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:6px}
+  .pathnote{color:var(--muted);font-size:12px;margin-bottom:24px;font-family:ui-monospace,monospace;
+    background:#fff;border:1px solid #e2e8f0;padding:6px 10px;border-radius:6px;word-break:break-all}
+  .flow{display:flex;flex-direction:column;align-items:center;gap:0}
+  .node{padding:12px 16px;text-align:center;border-radius:8px;border:2px solid;font-size:14px;
+    min-width:300px;max-width:560px;background:#fff;position:relative;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+  .node .t{font-weight:600}
+  .node .d{font-size:12px;color:var(--muted);margin-top:3px;font-weight:400}
+  .start{background:var(--start);border-color:var(--start-b);border-radius:40px}
+  .end{background:var(--end);border-color:var(--end-b);border-radius:40px}
+  .proc{background:var(--proc);border-color:var(--proc-b)}
+  .para{background:var(--para);border-color:var(--para-b)}
+  .note{background:var(--note);border-color:var(--note-b);border-style:dashed;color:var(--muted);font-size:12px}
+  .decision{
+    background:var(--dec);border-color:var(--dec-b);
+    clip-path:polygon(50% 0,100% 50%,50% 100%,0 50%);
+    border:none;padding:0;width:300px;height:120px;
+    display:flex;align-items:center;justify-content:center;
+  }
+  .decision .inner{width:60%;text-align:center;font-size:13px;font-weight:600;color:var(--dec-b)}
+  .arrow{width:2px;height:22px;background:var(--line);position:relative}
+  .arrow::after{content:"";position:absolute;bottom:-1px;left:50%;transform:translateX(-50%);
+    border:7px solid transparent;border-top-color:var(--line);border-bottom:0}
+  .label{font-size:11px;color:var(--muted);padding:0 6px}
+  .branch{display:flex;align-items:center;gap:0}
+  .branch .col{display:flex;flex-direction:column;align-items:center;gap:0}
+  .fork{display:flex;gap:40px;align-items:flex-start;justify-content:center;width:100%;position:relative}
+  .fork .col{flex:1;max-width:300px;display:flex;flex-direction:column;align-items:center;gap:0}
+  .yesno{display:flex;justify-content:space-between;width:340px;margin-bottom:-6px}
+  h2{font-size:16px;margin:36px 0 10px;border-left:4px solid var(--proc-b);padding-left:8px}
+  .legend{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;margin-top:10px}
+  .legend .sw{display:inline-block;width:16px;height:14px;border-radius:3px;border:2px solid;vertical-align:middle;margin-right:5px}
+  table{width:100%;border-collapse:collapse;font-size:13px;margin-top:10px}
+  th,td{border:1px solid #e2e8f0;padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:#f1f5f9}
+  code{background:#eef2ff;padding:1px 5px;border-radius:4px;font-size:12px}
+  .footer{margin-top:40px;color:var(--muted);font-size:12px;border-top:1px solid #e2e8f0;padding-top:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>文本扫描(Text Scan)工作流程</h1>
+  <div class="sub">ScanPage「文本扫描」标签 → <code>/api/v1/scan/text</code> → <code>scanner_service.scan_text()</code></div>
+  <div class="pathnote">backend/app/api/endpoints.py:scan_text &nbsp;|&nbsp; backend/app/services/scanner.py:scan_text/_scan_chunks/_process_similar_results</div>
+
+  <div class="legend">
+    <span><span class="sw" style="background:var(--start);border-color:var(--start-b)"></span>起止</span>
+    <span><span class="sw" style="background:var(--proc);border-color:var(--proc-b)"></span>处理</span>
+    <span><span class="sw" style="background:var(--dec);border-color:var(--dec-b)"></span>判断</span>
+    <span><span class="sw" style="background:var(--para);border-color:var(--para-b)"></span>并行检索</span>
+    <span><span class="sw" style="background:var(--note);border-color:var(--note-b)"></span>说明</span>
+  </div>
+
+  <div class="flow" style="margin-top:24px">
+    <!-- 1 start -->
+    <div class="node start"><div class="t">开始:UI「文本扫描」粘贴文本</div><div class="d">ScanPage → scanText(text)</div></div>
+    <div class="arrow"></div>
+
+    <!-- 2 endpoint -->
+    <div class="node proc"><div class="t">POST /api/v1/scan/text</div><div class="d">请求体 {text}</div></div>
+    <div class="arrow"></div>
+
+    <!-- 3 decision: length -->
+    <div class="decision"><div class="inner">去空白后<br>长度 &lt; 10 ?</div></div>
+    <div class="yesno" style="width:300px"><span class="label">是 →</span><span class="label">否 ↓</span></div>
+    <div class="fork">
+      <div class="col">
+        <div class="node end" style="min-width:180px"><div class="t">400 文本过短</div></div>
+      </div>
+      <div class="col">
+        <div class="arrow"></div>
+      </div>
+    </div>
+
+    <!-- 4 to_thread -->
+    <div class="node proc"><div class="t">asyncio.to_thread(scanner.scan_text)</div><div class="d">丢线程池,不阻塞事件循环</div></div>
+    <div class="arrow"></div>
+
+    <!-- 5 chunk -->
+    <div class="node proc"><div class="t">切片 _split_into_chunks</div>
+      <div class="d">DocumentParser:滑动窗口,优先在「。」/换行断句(边界过半才切),相邻 overlap</div></div>
+    <div class="arrow"></div>
+
+    <!-- 6 embed -->
+    <div class="node proc"><div class="t">批量嵌入 embed(全部 chunk 文本)</div>
+      <div class="d">复用 Indexer 的 embedder(与入库同模型同归一化);一次调用,Ollama 100/批</div></div>
+    <div class="arrow"></div>
+
+    <!-- 7 parallel query -->
+    <div class="node para"><div class="t">批量检索(仅 confidential + restricted,不含 public)</div>
+      <div class="d">各 child collection:collection.query(全部 embeddings, n_results=min(3,count))</div></div>
+    <div class="arrow"></div>
+
+    <!-- 8 similarity + adjust -->
+    <div class="node proc"><div class="t">相似度 = 1 − distance / 2</div>
+      <div class="d">归一化向量下 = 余弦;再 adjust_similarity 基线调整(bge-m3 ~0.37 → 0,量程 [0.37,1]→[0,1])</div></div>
+    <div class="arrow"></div>
+
+    <!-- 9 decision threshold -->
+    <div class="decision"><div class="inner">adjusted_sim ≥<br>阈值 ?</div></div>
+    <div class="yesno" style="width:320px"><span class="label">否 → 跳过</span><span class="label">是 ↓</span></div>
+    <div class="node note"><div class="t">阈值(均经 adjust 同尺度)</div>
+      <div class="d">confidential 0.6 &nbsp;|&nbsp; restricted 0.7 &nbsp;(settings.py)</div></div>
+    <div class="arrow"></div>
+
+    <!-- 10 locate -->
+    <div class="node proc"><div class="t">定位命中片段 _find_matching_positions</div>
+      <div class="d">词级匹配(中文退化字级),簇内 ≤5 聚合 → 生成 segment{content,start,end,level,confidence,matched_source,matched_content}</div></div>
+    <div class="arrow"></div>
+
+    <!-- 11 aggregate -->
+    <div class="node proc"><div class="t">汇总</div>
+      <div class="d">segments[] + chunk_results[] + summary{confidential, restricted} + total_chunks + has_sensitive</div></div>
+    <div class="arrow"></div>
+
+    <!-- 12 end -->
+    <div class="node end"><div class="t">返回 JSON → 前端高亮展示</div><div class="d">matched_source 指向命中的库内文档</div></div>
+  </div>
+
+  <h2>关键设计点</h2>
+  <table>
+    <tr><th>设计点</th><th>说明</th></tr>
+    <tr><td>只查 confidential + restricted</td><td>文本扫描是"泄密检测"视角,只关心输入是否触及机密/受限库;命中公开库不算敏感发现</td></tr>
+    <tr><td>批量 embed + 批量 query</td><td>一次 embed 全部 chunk、一次 query 传全部向量,避免逐 chunk 往返 Ollama / ChromaDB</td></tr>
+    <tr><td>复用 Indexer embedder</td><td>与入库同模型同归一化,相似度可比;否则 MPS 与 Ollama 数值实现差异会让 ranking 偏</td></tr>
+    <tr><td>基线调整 adjust_similarity</td><td>把 bge-m3 的 ~0.37 不相关基线压到 0,让 0.6/0.7 阈值直观,且与 DocScan / 去重同一尺度</td></tr>
+    <tr><td>top-n = min(3, count)</td><td>每个 chunk 每个密级只取 top-3 候选,再做阈值过滤</td></tr>
+    <tr><td>位置定位</td><td>词级聚类找命中区间供前端高亮;中文纯字流时退化为单字簇,仅影响高亮精度,不影响是否检出</td></tr>
+  </table>
+
+  <h2>与「文件扫描」(DocScan)的区别</h2>
+  <table>
+    <tr><th></th><th>文本扫描</th><th>文件扫描(DocScan)</th></tr>
+    <tr><td>输入</td><td>粘贴纯文本</td><td>上传文件</td></tr>
+    <tr><td>预处理</td><td>无,仅 DocumentParser 切片</td><td>X2MD 转换 + 父子块切片</td></tr>
+    <tr><td>比对</td><td>直接批量查 child 库</td><td>层级比对(摘要→父块→子块逐级跳过)</td></tr>
+    <tr><td>目标密级</td><td>confidential + restricted</td><td>public + restricted + confidential</td></tr>
+    <tr><td>重量</td><td>轻</td><td>重(含预处理、跨密级)</td></tr>
+  </table>
+
+  <div class="footer">文件:<code>文本扫描流程图.html</code> · 自包含(内嵌 CSS,离线可用) · 依据 backend/app/services/scanner.py 实际逻辑绘制</div>
+</div>
+</body>
+</html>
