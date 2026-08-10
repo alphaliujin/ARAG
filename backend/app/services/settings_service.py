@@ -57,6 +57,36 @@ DEFAULT_SETTINGS = {
 }
 
 
+def _validate_ollama_url(url: Any) -> str:
+    """校验 ollamaUrl, 防止 SSRF.
+
+    嵌入/LLM 调用时文档原文会 POST 到该 URL, 必须限制为 http/https 且拒绝云元数据
+    等危险端点。允许 loopback / RFC1918 内网 (Ollama 常部署于本地或局域网)。
+    """
+    from urllib.parse import urlparse
+
+    raw = str(url)
+    try:
+        parsed = urlparse(raw)
+    except Exception as e:
+        raise ValueError(f"ollamaUrl is not a valid URL: {raw!r} ({e})")
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(
+            f"ollamaUrl scheme must be http or https, got: {scheme!r} (url={raw!r})"
+        )
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ValueError(f"ollamaUrl must have a host: {raw!r}")
+    # 拒绝 link-local / 云元数据端点: 此类地址绝不可能是合法 Ollama 目标,
+    # 且是 SSRF 窃取云凭据的典型向量 (AWS/Azure/GCP metadata)。
+    if host in ("169.254.169.254", "metadata.google.internal", "metadata") or host.startswith("169.254."):
+        raise ValueError(
+            f"ollamaUrl points to a link-local/metadata endpoint, blocked for SSRF protection: {raw!r}"
+        )
+    return raw
+
+
 class SettingsService:
     """设置管理服务 - 线程安全."""
 
@@ -146,7 +176,8 @@ class SettingsService:
             raise ValueError(f"Unknown settings category: {category}")
 
         # 校验值范围和类型
-        for key, val in values.items():
+        for key in list(values.keys()):
+            val = values[key]
             if key in self._VALIDATION_RULES:
                 min_val, max_val, expected_type = self._VALIDATION_RULES[key]
                 try:
@@ -155,6 +186,9 @@ class SettingsService:
                     raise ValueError(f"Setting '{key}' must be {expected_type.__name__}, got: {val}")
                 if not (min_val <= converted <= max_val):
                     raise ValueError(f"Setting '{key}' must be between {min_val} and {max_val}, got: {converted}")
+                # 存转换后的值, 避免 "10"/1.9 经校验通过却以原始类型持久化/返回
+                # (旧实现存原始 val, get_all 返回 "10" 字符串或 1.9 浮点, 与校验类型不符)
+                values[key] = converted
 
         # 校验 embeddingModel 特殊规则
         if "embeddingModel" in values and values["embeddingModel"] not in self._ALLOWED_EMBEDDING_MODELS:
@@ -167,6 +201,10 @@ class SettingsService:
             raise ValueError(
                 f"Setting 'ocrLang' must be one of {self._ALLOWED_OCR_LANGS}, got: {values['ocrLang']}"
             )
+
+        # 校验 ollamaUrl (SSRF 防护: 限制 scheme + 拒绝云元数据端点)
+        if "ollamaUrl" in values:
+            values["ollamaUrl"] = _validate_ollama_url(values["ollamaUrl"])
 
         # 拒绝不在 _VALIDATION_RULES 或 DEFAULT_SETTINGS[category] 中的未知 key
         if category in DEFAULT_SETTINGS:

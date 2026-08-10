@@ -39,6 +39,7 @@ class TaskInfo:
     completed_at: Optional[float] = None
     params: dict = field(default_factory=dict)
     _cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    _thread: Optional[threading.Thread] = field(default=None, repr=False)
 
     @property
     def cancel_event(self) -> threading.Event:
@@ -286,7 +287,26 @@ class TaskManager:
                         info.completed_at = time.time()
 
         thread = threading.Thread(target=_worker, daemon=True)
+        # 保存线程引用, 供 wait_for_task 在优雅关闭时 join (否则 daemon 线程无引用,
+        # 主进程退出时被强杀, 任务状态可能停留在 RUNNING)
+        with self._lock:
+            info = self._tasks.get(task_id)
+            if info is not None:
+                info._thread = thread
         thread.start()
+
+    def wait_for_task(self, task_id: str, timeout: Optional[float] = None) -> bool:
+        """等待任务工作线程结束 (用于优雅关闭).
+
+        返回 True 若线程已结束/不存在, False 若超时。
+        """
+        with self._lock:
+            info = self._tasks.get(task_id)
+            thread = info._thread if info else None
+        if thread is None:
+            return True
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
 
     def make_progress_callback(self, task_id: str) -> Callable:
         """生成适配 progress_callback 签名的闭包.

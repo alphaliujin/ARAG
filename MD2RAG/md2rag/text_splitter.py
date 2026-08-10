@@ -60,12 +60,16 @@ def _split_text_with_regex(text: str, separator: str, keep_separator: bool, rule
         splits = re.split(f"({separator})", text)
 
     if not keep_separator:
-        # 移除所有空字符串和分隔符
-        result = []
-        for s in splits:
-            if s and s != separator:
-                result.append(s)
-        return result
+        # 移除空字符串和分隔符 token。
+        # re.split(f"({separator})", text) 把捕获组分隔符放在奇数下标位;
+        # 用位置判断而非字符串相等, 因为 is_separator_regex=True 时 separator 是
+        # 正则模式 (如 \d+), 实际匹配文本 ("123") 与模式串不相等, 旧 s != separator
+        # 无法过滤, 导致分隔符 token 残留进切片结果。
+        if rule == "before":
+            # (?=...) 零宽前瞻切分, splits 全是 content, 无分隔符 token
+            return [s for s in splits if s]
+        # rule == "after" / 默认: 奇数下标是分隔符捕获组, 仅取偶数下标
+        return [s for i, s in enumerate(splits) if i % 2 == 0 and s]
     else:
         # 保留分隔符
         result = []

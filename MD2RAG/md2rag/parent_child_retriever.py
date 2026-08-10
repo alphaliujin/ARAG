@@ -249,16 +249,37 @@ class ParentChildRetriever:
                 metadata=meta,
             )
 
-            # 4. 回查 parent
-            if return_parents and doc_id:
-                parent_text = self._get_parent_text(doc_id)
-                hit.parent_text = parent_text
-
             hits.append(hit)
+
+        # 4. 批量回查 parent (原实现逐 hit 调 _get_parent_text, 每次 ChromaDB get,
+        # n_results 条命中 = n 次 DB 往返; 批量一次 get 全部 parent 文本)
+        if return_parents and hits:
+            parent_doc_ids = [h.metadata.get("doc_id") or h.metadata.get("parent_doc_id", "")
+                              for h in hits]
+            needed = [d for d in parent_doc_ids if d]
+            parent_map = self._get_parent_texts(needed) if needed else {}
+            for h, doc_id in zip(hits, parent_doc_ids):
+                if doc_id:
+                    h.parent_text = parent_map.get(doc_id)
 
         elapsed_ms = (time.time() - start) * 1000
         log_timing(logger, "Parent-child search", elapsed_ms)
         return hits
+
+    def _get_parent_texts(self, doc_ids: List[str]) -> Dict[str, str]:
+        """批量从 parent collection 取多个 doc_id 的父块文本 (一次 DB 往返)."""
+        if not doc_ids:
+            return {}
+        try:
+            parent_coll = self._parent_coll()
+            result = parent_coll.get(ids=doc_ids, include=["documents"])
+            docs = result.get("documents") or []
+            ids = result.get("ids") or []
+            # ChromaDB 返回的 ids/docs 顺序与输入不一定一致, 用返回的 ids 作 key
+            return {rid: doc for rid, doc in zip(ids, docs) if doc}
+        except Exception as e:
+            logger.warning(f"[SEARCH] Batch parent get failed: {e}, falling back to per-id")
+            return {d: self._get_parent_text(d) for d in doc_ids}
 
     def _get_parent_text(self, doc_id: str) -> Optional[str]:
         """从 parent collection 取出 doc_id 对应的父块文本."""

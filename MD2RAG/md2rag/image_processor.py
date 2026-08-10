@@ -171,6 +171,19 @@ class ViTImageEmbedder:
                 image.close()
             except Exception:
                 pass
+            # 释放 GPU tensor + MPS 缓存, 防止长跑入库 MPS allocator 碎片化 OOM
+            # (对标 MPSEmbedder.embed 的清理逻辑; ViT-Large 中间 tensor 可达数百 MB)
+            try:
+                del inputs, vision_outputs, image_features
+            except Exception:
+                pass
+            if self.device != "cpu":
+                try:
+                    import torch
+                    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
+                except Exception:
+                    pass
 
     def release(self) -> None:
         """释放 ViT 模型和 PyTorch 缓存。"""
@@ -246,6 +259,18 @@ class ViTImageEmbedder:
                 except Exception:
                     pass
             images.clear()
+            # 释放 GPU tensor + MPS 缓存 (同 embed_image, 对标 MPSEmbedder)
+            try:
+                del inputs, vision_outputs, image_features
+            except Exception:
+                pass
+            if self.device != "cpu":
+                try:
+                    import torch
+                    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
+                except Exception:
+                    pass
 
 
 class ImageProcessor:

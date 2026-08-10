@@ -1441,17 +1441,37 @@ class DocScanService:
         files = [f for f in docscan_dir.iterdir()
                  if f.is_file() and not f.name.startswith('.')]
 
+        # 一次 iterdir 收集所有 .parents.json 的 stem, 避免逐文件调 get_file_status
+        # 各自再 iterdir 搜源文件 (O(N²) 目录扫描)。stats 遍历的是真实源文件,
+        # f.stem 即 actual_stem, 直接用集合 membership 判定是否已预处理。
+        parents_stems = {
+            f.name[:-len(".parents.json")]
+            for f in files
+            if f.name.endswith(".parents.json")
+        }
+
         preprocessed = 0
         embedded = 0
         compared = 0
         for f in files:
-            status = self.get_file_status(f.name)
-            if status["preprocessed"]:
-                preprocessed += 1
-            if status["embedded"]:
-                embedded += 1
-            if status["compared"]:
-                compared += 1
+            stem = f.stem
+            if stem not in parents_stems:
+                continue
+            preprocessed += 1
+            # embedded/compared 需读 parents.json[0]["vector"] 标记 (仅对已预处理文件)
+            parents_file = docscan_dir / f"{stem}.parents.json"
+            try:
+                p_data = json.loads(parents_file.read_text(encoding="utf-8"))
+                if p_data:
+                    vector_str = p_data[0].get("vector", "") or ""
+                    if VECTOR_BEGIN in vector_str:
+                        embedded += 1
+                        if VECTOR_END in vector_str:
+                            after_end = vector_str[vector_str.index(VECTOR_END) + len(VECTOR_END):]
+                            if after_end:
+                                compared += 1
+            except Exception:
+                pass
 
         return {
             "total_files": len(files),

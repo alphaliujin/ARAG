@@ -184,7 +184,12 @@ class HtmlConverter(BaseConverter):
             href = element.get("href", "")
             text = element.get_text(strip=True)
             if text and href:
-                parts.append(f"[{text}]({href})")
+                # 协议白名单: 阻止 javascript:/data:/vbscript: 等 XSS 注入到 Markdown 输出。
+                # 不安全协议丢弃 href, 仅保留链接文本。
+                if href.startswith(("http://", "https://", "mailto:", "#", "ftp://")):
+                    parts.append(f"[{text}]({href})")
+                else:
+                    parts.append(text)
             elif text:
                 parts.append(text)
             return

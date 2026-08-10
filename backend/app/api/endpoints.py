@@ -102,22 +102,11 @@ async def scan_document(file: UploadFile = File(...)):
 
     # Enforce upload size limit even when file.size is None (common in FastAPI)
     MAX_UPLOAD_SIZE = settings.MAX_UPLOAD_SIZE
-    chunks = []
-    total_size = 0
-    while True:
-        chunk = await file.read(1024 * 1024)  # 1MB chunks
-        if not chunk:
-            break
-        total_size += len(chunk)
-        if total_size > MAX_UPLOAD_SIZE:
-            raise HTTPException(status_code=400, detail=f"File too large (>{MAX_UPLOAD_SIZE // (1024*1024)}MB)")
-        chunks.append(chunk)
-    content = b"".join(chunks)
-
     docscan_dir = Path(settings.DOCSCAN_DIR)
     docscan_dir.mkdir(parents=True, exist_ok=True)
 
     try:
+        # 确定目标路径 (不依赖文件内容, 先于读取完成)
         raw_name = file.filename or f"upload{file_ext}"
         safe_filename = Path(raw_name).name  # strip any directory components
         # Verify no path traversal — 用 relative_to 而非 startswith,
@@ -135,8 +124,26 @@ async def scan_document(file: UploadFile = File(...)):
                 counter += 1
             docscan_path = docscan_dir / f"{stem}_{counter}{file_ext}"
 
+        # 流式写盘: 读一块写一块, 不再把整个文件攒进内存 (原 chunks=[] + b"".join
+        # 对 50MB 文件峰值占 ~100MB+ 内存)。超限时删除已写的部分文件, 不留残骸。
+        total_size = 0
+        too_large = False
         async with aiofiles.open(str(docscan_path), 'wb') as f:
-            await f.write(content)
+            while True:
+                chunk = await file.read(1024 * 1024)  # 1MB chunks
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > MAX_UPLOAD_SIZE:
+                    too_large = True
+                    break
+                await f.write(chunk)
+        if too_large:
+            try:
+                docscan_path.unlink()
+            except OSError:
+                pass
+            raise HTTPException(status_code=400, detail=f"File too large (>{MAX_UPLOAD_SIZE // (1024*1024)}MB)")
 
         return {
             "status": "success",
@@ -239,7 +246,7 @@ async def docscan_file_status(filename: str = Query(..., description="文件名"
 @router.get("/docscan/files")
 async def list_docscan_files():
     """列出 DocScan 目录下所有已扫描上传的文件."""
-    try:
+    def _list():
         docscan_dir = Path(settings.DOCSCAN_DIR)
         if not docscan_dir.exists():
             return {"files": [], "count": 0}
@@ -260,6 +267,10 @@ async def list_docscan_files():
         # 按修改时间降序排列
         files.sort(key=lambda x: x["modified"], reverse=True)
         return {"files": files, "count": len(files)}
+
+    try:
+        # 阻塞 I/O (iterdir/stat) 放到线程池, 避免卡住事件循环 (与 get_status 一致)
+        return await asyncio.to_thread(_list)
     except Exception as e:
         logger.error(f"Error in list_docscan_files: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -274,19 +285,20 @@ async def delete_docscan_file(name: str = Query(..., description="文件名 (仅
     if not name or any(c in name for c in ("/", "\\", "\x00")) or ".." in name:
         raise HTTPException(status_code=400, detail="Invalid file name")
 
-    docscan_dir = Path(settings.DOCSCAN_DIR).resolve()
-    target = (docscan_dir / name).resolve()
+    def _delete():
+        # 阻塞 I/O (resolve/exists/unlink/rmtree) 在线程池执行
+        docscan_dir = Path(settings.DOCSCAN_DIR).resolve()
+        target = (docscan_dir / name).resolve()
 
-    # 路径穿越防御
-    try:
-        target.relative_to(docscan_dir)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Path traversal denied")
+        # 路径穿越防御
+        try:
+            target.relative_to(docscan_dir)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Path traversal denied")
 
-    if not target.exists() or not target.is_file():
-        raise HTTPException(status_code=404, detail=f"File not found: {name}")
+        if not target.exists() or not target.is_file():
+            raise HTTPException(status_code=404, detail=f"File not found: {name}")
 
-    try:
         logger.info(f"[AUDIT] Delete operation: docscan file '{name}' deleted")
         os.unlink(target)
         # 同步清理 X2MD 输出的 <stem>.md/ 目录(含 parents/children JSON 与嵌入),
@@ -304,6 +316,11 @@ async def delete_docscan_file(name: str = Query(..., description="文件名 (仅
             # stem 解析后落在 docscan_dir 之外(理论不会发生,name 已校验过),静默跳过
             pass
         return {"status": "success", "message": f"已删除: {name}"}
+
+    try:
+        return await asyncio.to_thread(_delete)
+    except HTTPException:
+        raise  # 400/404 原样上抛, 不被下面的 500 吞掉
     except Exception as e:
         logger.error(f"Error in delete_docscan_file: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -314,30 +331,38 @@ async def delete_all_docscan_files():
     """清空 DocScan 目录下全部内容(源文件 + .md + .parents/.children JSON + images/),
     保留目录本身。仅删 docscan_dir 内的条目、不跟随符号链接(防穿越)。
     """
-    docscan_dir = Path(settings.DOCSCAN_DIR).resolve()
-    if not docscan_dir.exists():
-        return {"status": "success", "message": "DocScan 目录不存在, 无需清理", "deleted": 0}
+    def _delete_all():
+        docscan_dir = Path(settings.DOCSCAN_DIR).resolve()
+        if not docscan_dir.exists():
+            return {"status": "success", "message": "DocScan 目录不存在, 无需清理", "deleted": 0}
 
-    deleted = 0
-    for entry in docscan_dir.iterdir():
-        if entry.is_symlink():
-            continue  # 防符号链接穿越
-        try:
-            entry.resolve().relative_to(docscan_dir)  # 必须落在 docscan_dir 内
-        except ValueError:
-            continue
-        try:
-            if entry.is_file():
-                entry.unlink()
-            elif entry.is_dir():
-                import shutil
-                shutil.rmtree(entry, ignore_errors=True)
-            deleted += 1
-        except Exception as e:
-            logger.warning(f"[AUDIT] Failed to delete {entry.name}: {e}")
+        deleted = 0
+        for entry in docscan_dir.iterdir():
+            if entry.is_symlink():
+                continue  # 防符号链接穿越
+            try:
+                entry.resolve().relative_to(docscan_dir)  # 必须落在 docscan_dir 内
+            except ValueError:
+                continue
+            try:
+                if entry.is_file():
+                    entry.unlink()
+                elif entry.is_dir():
+                    import shutil
+                    shutil.rmtree(entry, ignore_errors=True)
+                deleted += 1
+            except Exception as e:
+                logger.warning(f"[AUDIT] Failed to delete {entry.name}: {e}")
 
-    logger.info(f"[AUDIT] Delete-all: cleared {deleted} entries from DocScan dir")
-    return {"status": "success", "message": f"已清空 DocScan ({deleted} 项)", "deleted": deleted}
+        logger.info(f"[AUDIT] Delete-all: cleared {deleted} entries from DocScan dir")
+        return {"status": "success", "message": f"已清空 DocScan ({deleted} 项)", "deleted": deleted}
+
+    try:
+        # 阻塞 I/O (iterdir/unlink/rmtree) 放到线程池, 避免卡住事件循环
+        return await asyncio.to_thread(_delete_all)
+    except Exception as e:
+        logger.error(f"Error in delete_all_docscan_files: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/docscan/stats")
@@ -566,7 +591,7 @@ async def run_deduplication():
 @router.get("/dedup/results")
 async def get_dedup_results():
     """获取去重结果文件列表."""
-    try:
+    def _list():
         dedup_dir = Path(settings.DATA_DIR).parent / "dedup_results"
         if not dedup_dir.exists():
             return {"files": [], "count": 0}
@@ -582,6 +607,10 @@ async def get_dedup_results():
             })
 
         return {"files": files, "count": len(files)}
+
+    try:
+        # 阻塞 I/O (glob/stat) 放到线程池, 避免卡住事件循环
+        return await asyncio.to_thread(_list)
     except Exception as e:
         logger.error(f"Error in get_dedup_results: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -765,7 +794,17 @@ async def update_settings_category(category: str, request: SettingsUpdateRequest
     try:
         from app.services.settings_service import settings_service
         updated = settings_service.update_category(category, request.values)
-        return {"status": "success", "category": category, "values": updated}
+        response = {"status": "success", "category": category, "values": updated}
+        # vectorDbDir / collectionPrefix 改动需重启后端才生效 (运行中的 vector_db_service
+        # 仍持有旧路径/client), 提示用户重启
+        if category == "database" and any(
+            k in updated for k in ("vectorDbDir", "collectionPrefix")
+        ):
+            response["warning"] = (
+                "vectorDbDir/collectionPrefix 已更新, 需重启后端服务后生效 "
+                "(运行中的向量库连接仍使用旧路径)"
+            )
+        return response
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

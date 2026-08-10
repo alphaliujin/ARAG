@@ -31,6 +31,8 @@ class OllamaClient:
         # 这样 max_concurrent 线程可以真正并行排队，而不是被全局 sleep 串行化
         self._next_call_time: float = 0.0
         self._rate_lock = threading.Lock()
+        # _cache 被 ThreadPoolExecutor 并发读写, 需独立锁保护 (与 _rate_lock 职责不同)
+        self._cache_lock = threading.Lock()
 
     def _throttle(self):
         """抢占下一个允许的调用时刻；只在已过期时才立即返回。
@@ -66,17 +68,27 @@ class OllamaClient:
         return json.loads(body)
 
     def _add_to_cache(self, key: str, value: str) -> None:
-        if len(self._cache) >= self._max_cache_size:
-            # FIFO: 丢弃最早插入的一半
-            keys_to_discard = list(self._cache.keys())[:self._max_cache_size // 2]
-            for k in keys_to_discard:
-                del self._cache[k]
-        self._cache[key] = value
+        # _cache 被 ThreadPoolExecutor 并发读写 (llm_batch_strip_noise), 必须加锁:
+        # check-then-act (len 判断 -> 删一半 -> 写入) 否则并发会过度删除。
+        with self._cache_lock:
+            if len(self._cache) >= self._max_cache_size:
+                # FIFO: 丢弃最早插入的一半
+                keys_to_discard = list(self._cache.keys())[:self._max_cache_size // 2]
+                for k in keys_to_discard:
+                    del self._cache[k]
+            self._cache[key] = value
+
+    def _cache_get(self, key: str) -> str | None:
+        """线程安全的缓存读取 (与 _add_to_cache 共用 _cache_lock)。"""
+        with self._cache_lock:
+            return self._cache.get(key)
 
     def generate(self, prompt: str, system: str = "", use_cache: bool = True) -> str:
         cache_key = self._cache_key(prompt)
-        if use_cache and cache_key in self._cache:
-            return self._cache[cache_key]
+        if use_cache:
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                return cached
 
         payload: dict[str, Any] = {
             "model": self.model,
@@ -98,8 +110,10 @@ class OllamaClient:
         use_cache: bool = True,
     ) -> str:
         cache_key = self._cache_key(json.dumps(messages, ensure_ascii=False, sort_keys=True))
-        if use_cache and cache_key in self._cache:
-            return self._cache[cache_key]
+        if use_cache:
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                return cached
 
         payload = {
             "model": self.model,
@@ -121,8 +135,10 @@ class OllamaClient:
         use_cache: bool = True,
     ) -> str:
         cache_key = self._cache_key(prompt + "".join(images))
-        if use_cache and cache_key in self._cache:
-            return self._cache[cache_key]
+        if use_cache:
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                return cached
 
         payload: dict[str, Any] = {
             "model": self.model,

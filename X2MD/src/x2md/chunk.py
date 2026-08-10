@@ -474,6 +474,9 @@ class SmallerChunksStrategy:
         child_chunks: list[Chunk] = []
         child_index = 0
         search_offset = 0  # 在原文中逐个定位 parent 文本的起始字符位置，避免 find 重复命中
+        # IntervalSearch 构造需对全部 element 区间排序, 与 parent 数量无关;
+        # 提到循环外复用, 避免每个 parent 重复 O(E log E) 构造 (原 O(P·E log E))
+        parent_searcher = IntervalSearch(element_indexes) if element_indexes is not None else None
 
         for parent in parent_chunks:
             # 子分块切分 parent.text (而非原始全文),所以元素索引需要
@@ -494,8 +497,7 @@ class SmallerChunksStrategy:
                     p_start = search_offset
                 # 推进 search_offset，保证下一个 parent 搜索不会重复命中当前位置
                 search_offset = max(search_offset, p_start + 1)
-                # 通过 parent 的 IntervalSearch 找覆盖的元素
-                parent_searcher = IntervalSearch(element_indexes)
+                # 通过 (循环外构造的) parent_searcher 找覆盖的元素
                 parent_el_indices = parent_searcher.find([p_start, p_start + len(parent.text)])
                 if parent_el_indices:
                     # 将文档级索引转换为 parent-relative 累积偏移

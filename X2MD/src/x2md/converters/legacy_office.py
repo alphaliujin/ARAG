@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 def _run_soffice(
-    src: Path, target_format: str, tmpdir: str, extra_env: dict | None = None
+    src: Path, target_format: str, tmpdir: str
 ) -> tuple[Path | None, str]:
     """Run `soffice --headless --convert-to <fmt>` and return (output_path, stderr_text).
 

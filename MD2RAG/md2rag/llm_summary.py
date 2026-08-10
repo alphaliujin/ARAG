@@ -116,10 +116,14 @@ class OllamaChatClient:
         )
         loop = asyncio.get_event_loop()
         try:
-            resp = await loop.run_in_executor(
-                None, lambda: urllib.request.urlopen(req, timeout=self.timeout)
-            )
-            data = json.loads(resp.read().decode("utf-8"))
+            # urlopen 返回的 HTTPResponse 持有底层 socket, 必须在 executor 内用 with
+            # 关闭, 否则 FastAPI 长跑进程中 fd 会累积泄漏 (CPython 靠 __del__ 兜底, 不可靠)。
+            def _do_request() -> str:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    return resp.read().decode("utf-8")
+
+            body = await loop.run_in_executor(None, _do_request)
+            data = json.loads(body)
             # 即使响应解析成功,也只把"模型正常返回空"作为合法的 ""。
             return data.get("message", {}).get("content", "").strip()
         except urllib.error.URLError as e:

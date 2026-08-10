@@ -39,32 +39,34 @@ class ScannerService:
     def _scan_chunks(self, chunks: List[Dict]) -> Dict:
         """批量扫描核心 — 批量嵌入 + 批量 ChromaDB 查询."""
 
-        from app.services.ingestion import data_ingestion_service
-        from md2rag.embedder import create_embedder, Embedder
+        from app.services.ingestion import data_ingestion_service, create_embedder_from_settings
 
         # 1. 批量嵌入所有 chunk 文本 (一次性, 而非逐个)
         chunk_texts = [chunk["content"] for chunk in chunks]
 
-        # 使用 Indexer 的 embedder (与入库一致)
+        # 使用 Indexer 的 embedder (与入库一致); 取不到时 fallback 创建临时 embedder。
+        # fallback embedder 用完必须 release(), 否则 MPSEmbedder 模型权重(~2GB) 驻留
+        # GPU 直到进程退出 (OllamaEmbedder 的 SQLite 缓存连接也会泄漏)。
+        _fallback_embedder = None
         try:
             indexer = data_ingestion_service._get_indexer()
             embedder = indexer.embedder
         except Exception:
-            # fallback: 创建临时 embedder
-            if settings.EMBEDDING_MODEL == "ollama-bge-m3":
-                embedder = create_embedder(
-                    model_type="ollama",
-                    ollama_url=settings.OLLAMA_BASE_URL,
-                    ollama_model="bge-m3:latest",
-                )
-            elif settings.EMBEDDING_MODEL == "mps-bge-m3":
-                embedder = create_embedder(model_type="mps", device="mps")
-            else:
-                embedder = create_embedder(model_type="chromadb-default")
+            # fallback: 与 Indexer._create_embedder 判序一致的工厂函数 (含 ollama_cache_path)
+            _fallback_embedder = create_embedder_from_settings()
+            embedder = _fallback_embedder
 
         # ★ 批量嵌入: 一次调用 embed() 传入所有文本, OllamaEmbedder 内部会用
         # /api/embed 批量接口, 100个一批; MPSEmbedder 16个一批; 避免逐个嵌入
-        all_embeddings = embedder.embed(chunk_texts)
+        try:
+            all_embeddings = embedder.embed(chunk_texts)
+        finally:
+            if _fallback_embedder is not None:
+                try:
+                    _fallback_embedder.release()
+                except Exception:
+                    pass
+                _fallback_embedder = None
 
         # 2. 批量 ChromaDB 查询 — 一次传全部 query_embeddings
         # ChromaDB collection.query() 支持多个 query_embeddings,

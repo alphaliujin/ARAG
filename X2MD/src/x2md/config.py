@@ -36,7 +36,7 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
     },
     "image": {
         "ocr_enabled": "true",
-        "ocr_lang": "eng",
+        "ocr_lang": "chi_sim+eng",
         "ocr_engine": "paddleocr",
         "ocr_paddle_model": "PP-OCRv6_medium",
     },

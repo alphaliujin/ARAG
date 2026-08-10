@@ -29,6 +29,33 @@ from app.services.vector_db import vector_db_service
 from md2rag.loader import CLASSIFICATION_DIR_MAP
 
 
+def create_embedder_from_settings():
+    """根据 backend settings 创建 embedder, 判序与 Indexer._create_embedder 一致.
+
+    scanner fallback 与 indexer 共用此函数, 避免入库向量与查询向量空间不一致
+    (旧 scanner fallback 自行按 EMBEDDING_MODEL 字符串建 embedder, 缺 ollama_cache_path
+    且判序与 indexer 不同)。用完必须由调用方 release()。
+
+    判序 (与 _build_md2rag_config 对齐, backend settings 不暴露 sentence-transformers):
+      ollama-bge-m3 -> ollama (含 embedding cache)
+      mps-bge-m3    -> mps
+      其它          -> chromadb-default
+    """
+    from md2rag.embedder import create_embedder
+
+    model = (settings.EMBEDDING_MODEL or "").lower()
+    if model == "ollama-bge-m3":
+        return create_embedder(
+            model_type="ollama",
+            ollama_url=settings.OLLAMA_BASE_URL,
+            ollama_model="bge-m3:latest",
+            ollama_cache_path=str(Path(settings.VECTOR_DB_DIR) / "md2rag_embedding_cache.sqlite"),
+        )
+    if model == "mps-bge-m3":
+        return create_embedder(model_type="mps", device="mps")
+    return create_embedder(model_type="chromadb-default")
+
+
 class DataIngestionService:
     """入库服务 - 薄包装 MD2RAG Indexer (V2 内存优化版)."""
 

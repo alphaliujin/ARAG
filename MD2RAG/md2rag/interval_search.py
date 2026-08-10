@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import bisect
 from typing import List, Sequence
 
 
@@ -46,21 +47,19 @@ class IntervalSearch:
         if not self._indexes:
             return []
         t_start, t_end = target[0], target[1]
-        # 找 lo: 第一个 end > t_start 的 sorted 下标
+        # hi: 最后一个 start < t_end。_starts 升序, 用 bisect 降为 O(log n)
+        # (原线性倒扫对大文档数万 element 时每个 chunk 都 O(n))
+        hi = bisect.bisect_left(self._starts, t_end) - 1
+        if hi < 0:
+            return []
+        # lo: 第一个 end > t_start。_ends 未排序 (按 start 排序后 ends 可能乱序),
+        # 无法 bisect; 但范围已缩到 [0, hi], 线性扫描成本上限为 hi。
         lo = -1
-        for i, end in enumerate(self._ends):
-            if end > t_start:  # 严格大于，排除边界接触
+        for i in range(hi + 1):
+            if self._ends[i] > t_start:  # 严格大于, 排除边界接触
                 lo = i
                 break
         if lo == -1:
-            return []
-        # 找 hi: 最后一个 start < t_end 的 sorted 下标
-        hi = -1
-        for i in range(len(self._starts) - 1, -1, -1):
-            if self._starts[i] < t_end:
-                hi = i
-                break
-        if hi == -1 or hi < lo:
             return []
         # 映射回原始下标列表，但需验证实际重叠
         # 注意：ends 未排序（按 start 排序后 ends 可能乱序），

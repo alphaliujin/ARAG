@@ -238,17 +238,10 @@ class VitExtractor:
                 lines.append(f"- {label}: {score:.4f}")
             lines.append("")
 
-        image_embeds = features.get("image_embeds", [])
-        if image_embeds:
-            lines.append("## Image Embedding (512d)")
-            lines.append("")
-            lines.append("```json")
-            lines.append(json.dumps(image_embeds[:20]))
-            lines.append("```")
-            lines.append(
-                f"*(truncated to first 20 of {len(image_embeds)} dimensions)*"
-            )
-            lines.append("")
+        # 注: 不再写入 image_embeds 到 .md。X2MD 用 clip-vit-base-patch32 (512d),
+        # 而 MD2RAG 用 clip-vit-large-patch14 (1024d) 会重新嵌入图像, 两者模型/维度
+        # 不同无法直接复用; 截断为前 20 维写入既不可用于检索又有误导性, 纯属浪费。
+        # zero-shot 分类标签已写入上方, 足够供检索元数据使用。
 
         md_path.write_text("\n".join(lines), encoding="utf-8")
         return md_path

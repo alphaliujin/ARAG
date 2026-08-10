@@ -441,7 +441,11 @@ class VectorStore:
         """
         log_step(logger, "RESET_ALL", "Resetting all collections...")
         try:
-            client = self._get_client()
+            # _get_client() 内部是 check-then-set (if self._client is None: ...), 非原子。
+            # 必须在 _collection_lock 内调用, 否则与并发 get_or_create_collection 竞态
+            # 会创建两个 PersistentClient, 旧句柄泄漏 SQLite 锁/文件句柄。
+            with self._collection_lock:
+                client = self._get_client()
         except Exception as e:
             logger.error(f"[RESET] Failed to init ChromaDB client: {e}")
             with self._collection_lock:

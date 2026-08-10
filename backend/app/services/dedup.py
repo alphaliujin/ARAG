@@ -15,8 +15,8 @@
 2. 从 ChromaDB 同时读取入库时已存储的向量和对应的文本/元数据，
    保证向量与文本严格对齐，且两次比对结果完全一致（确定性）。
 3. 匹配详情中附带父块上下文，便于用户理解匹配内容的完整上下文。
-4. 基线调整: bge-m3 不相关文本基线 ≈ 0.37, 将有效量程重标定到 [0,1],
-   与 DocScan 和 Scanner 保持一致。
+4. 基线调整: bge-m3 不相关文本基线 ≈ 0.37, 将有效量程重标定到 [0,1] (线性映射)。
+   DocScan 用 √ 映射 (adjust_similarity_docscan), 两者单调但阈值不可互换。
 """
 
 from __future__ import annotations
@@ -287,6 +287,9 @@ class DataDeduplicationService:
         BATCH_SIZE = 200
         all_matches = []
         pair_completed = 0
+        # 预建每个 target 的 n-gram set, 避免在 match 循环内对同一 target 反复重建
+        # (同一 target 可能被多个 source 命中, 原 build_ngram_index([target_text]) 逐对重建)
+        target_ngram_sets = [build_ngram_index([t]) for t in target_texts]
 
         for batch_start in range(0, source_count, BATCH_SIZE):
             # 协作式取消检查
@@ -333,10 +336,12 @@ class DataDeduplicationService:
                 source_idx = batch_start + int(j)
                 similarity = float(sim_batch[j, k])
                 adjusted_sim = float(adjusted_batch[j, k])
-                # 结果按 adjusted 三档分类 (与 DocScan 一致):
+                # 结果按 adjusted 三档分类:
                 # ≥0.8: 高度相似(几乎确定是重复)
                 # 0.5-0.8: 中度相似(主题相近, 需要人工确认)
                 # <0.5: 弱相关(语义有交叠但不算重复) -- 已被掩码过滤
+                # 注: 这里 adjusted 是线性映射 (raw-0.37)/0.63; DocScan 用 √ 映射
+                # (adjust_similarity_docscan), 两者单调但数值不等价, 阈值不可互换。
                 source_meta = source_metadatas[source_idx]
                 target_meta = target_metadatas[int(k)]
                 source_text = source_texts[source_idx]
@@ -346,8 +351,8 @@ class DataDeduplicationService:
                 # boilerplate / 同领域不同内容, 不该自动列入"准备去重"。
                 # 这里逐对算 (query=source, target=target) 的字面信号。
                 text_overlap = text_ngram_overlap(source_text, target_text)
-                # 单文档内 longest_run (target 是单条 chunk, 直接用其 ngram set)
-                target_grams = build_ngram_index([target_text])
+                # 单文档内 longest_run: 用预建的 target n-gram set (避免逐对 build_ngram_index)
+                target_grams = target_ngram_sets[int(k)]
                 longest_run = longest_matching_run(source_text, target_grams)
 
                 match_info = {
@@ -577,32 +582,35 @@ class DataDeduplicationService:
                 self._write_markdown(output_dir, label, result)
                 self._write_json(output_dir, label, result)
 
-        # 写入"准备去重.md": 超过 dedup_threshold 的匹配记录
-        # ★ 使用 adjusted_similarity 与阈值比较, 与三档分桶和 DocScan 保持一致
-        # (dedup_threshold 是 adjusted 尺度, raw similarity 不可直接与 adjusted 阈值比较)
-        # B1: 同时要求 n-gram 字面支持 (overlap≥0.3 或 run≥30), 防止纯向量
-        # boilerplate / 同领域不同内容被自动列入"准备去重"
-        dedup_items = []
-        for label, result in results.items():
-            for m in result.matches:
-                if m["adjusted_similarity"] >= dedup_threshold:
-                    text_overlap = m.get("text_overlap", 0.0)
-                    longest_run = m.get("longest_run", 0)
-                    if text_overlap < 0.3 and longest_run < 30:
-                        continue  # n-gram 不支持, 跳过 (避免假阳性误删)
-                    dedup_items.append({
-                        "pair_label": label,
-                        "pair_name": result.pair_name,
-                        "source_chunk_id": m.get("source_chunk_id", ""),
-                        "similarity": m["similarity"],
-                        "adjusted_similarity": m["adjusted_similarity"],
-                        "source_text": m["source_text"],
-                        "target_text": m["target_text"],
-                        "source_parent_text": m.get("source_parent_text", ""),
-                        "target_parent_text": m.get("target_parent_text", ""),
-                    })
+            # 写入"准备去重.md": 超过 dedup_threshold 的匹配记录
+            # ★ 必须在 _write_lock 内: 否则并发 dedup 时 T1 的 .md/.json 被 T2 清空覆盖后,
+            # T1 仍基于自身 results 写出 准备去重.md, 与 .json(已是 T2)状态脱节。
+            # ★ 使用 adjusted_similarity 与阈值比较, 与三档分桶一致
+            # (dedup_threshold 是 adjusted 尺度, raw similarity 不可直接与 adjusted 阈值比较;
+            #  注意 dedup 用线性 adjust, DocScan 用 √ adjust, 数值不等价)
+            # B1: 同时要求 n-gram 字面支持 (overlap≥0.3 或 run≥30), 防止纯向量
+            # boilerplate / 同领域不同内容被自动列入"准备去重"
+            dedup_items = []
+            for label, result in results.items():
+                for m in result.matches:
+                    if m["adjusted_similarity"] >= dedup_threshold:
+                        text_overlap = m.get("text_overlap", 0.0)
+                        longest_run = m.get("longest_run", 0)
+                        if text_overlap < 0.3 and longest_run < 30:
+                            continue  # n-gram 不支持, 跳过 (避免假阳性误删)
+                        dedup_items.append({
+                            "pair_label": label,
+                            "pair_name": result.pair_name,
+                            "source_chunk_id": m.get("source_chunk_id", ""),
+                            "similarity": m["similarity"],
+                            "adjusted_similarity": m["adjusted_similarity"],
+                            "source_text": m["source_text"],
+                            "target_text": m["target_text"],
+                            "source_parent_text": m.get("source_parent_text", ""),
+                            "target_parent_text": m.get("target_parent_text", ""),
+                        })
 
-        self._write_dedup_ready_md(output_dir, dedup_threshold, dedup_items)
+            self._write_dedup_ready_md(output_dir, dedup_threshold, dedup_items)
 
         # 自动去重: 如果勾选了 auto_dedup，从高密级库删除超过阈值的 chunk
         dedup_deleted_total = 0
@@ -903,7 +911,16 @@ class DataDeduplicationService:
                 for m in result_data.get("matches", []):
                     # ★ 使用 adjusted_similarity 与阈值比较, 与比对筛选和三档分桶一致
                     # (dedup_threshold 是 adjusted 尺度, raw similarity 不能直接比较)
-                    adj_sim = m.get("adjusted_similarity", m.get("similarity", 0.0))
+                    if "adjusted_similarity" in m:
+                        adj_sim = m["adjusted_similarity"]
+                    elif "similarity" in m:
+                        # 旧版/外部结果缺 adjusted_similarity: 用线性公式从 raw 换算
+                        # (与 run_deduplication 的 adjust 一致), 而非直接拿 raw 比阈值
+                        # (raw 尺度偏高, 会把不达标的对误判为重复)
+                        raw = m["similarity"]
+                        adj_sim = max(0.0, (raw - BGE_M3_BASELINE) / (1.0 - BGE_M3_BASELINE))
+                    else:
+                        adj_sim = 0.0
                     if adj_sim >= dedup_threshold and m.get("source_chunk_id"):
                         ids_by_cls.setdefault(source_cls, set()).add(m["source_chunk_id"])
                         total_items += 1
