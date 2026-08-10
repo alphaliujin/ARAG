@@ -40,7 +40,10 @@ DEFAULT_SETTINGS = {
     },
     "preprocess": {
         "chunkSize": 500,
-        "chunkOverlap": 50,
+        # 与 backend config.CHUNK_OVERLAP_DEFAULT (=100, A4 修复) 及 X2MD x2md.conf
+        # (chunk_overlap=100) 对齐。原值 50 会在启动时经 _apply_runtime_settings
+        # 覆盖 config 的 100, 静默回退 A4 修复, 导致句子边界处敏感信息硬切。
+        "chunkOverlap": 100,
         "enableOCR": True,
         "enableLLM": False,
         "ocrLang": "chi_sim+eng",

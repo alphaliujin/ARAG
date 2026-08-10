@@ -70,7 +70,6 @@ class TestSwitchEmbeddingModel(unittest.TestCase):
         # 跳过 __init__ (其内部仅设字段, 无重依赖, 但此处用 __new__ 更隔离)
         svc = DataIngestionService.__new__(DataIngestionService)
         svc._indexer = None
-        svc._use_v2 = True
         svc._md2rag_config = None
         svc.reset_all = MagicMock(return_value=reset_result)
         _ss_mod.settings_service.update_category.reset_mock()

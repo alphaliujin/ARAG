@@ -107,13 +107,18 @@ class ChunkSplitter:
         chunk_overlap: int = 100,
         separators: Optional[list[str]] = None,
         separator_rule: Optional[list[str]] = None,
-        is_separator_regex: bool = True,
+        # 分隔符均为字面量 (\n\n / 。 / ！ / . 等), 非正则。默认 True 会让 "." 被当作
+        # "任意字符" 正则: 在无 \n/。/！/？/； 的英文段落上 _split_with_separator 会
+        # 把文本逐字符拆分 (re.finditer(".") 命中每个字符), 再靠 merge 逻辑重新拼回,
+        # 退化为字符级切分而非按句号断句。改为 False 后所有分隔符经 re.escape 视作
+        # 字面量, "." 正确匹配英文句号 (CJK 标点 。！？； 本就不是正则元字符, 不受影响)。
+        is_separator_regex: bool = False,
         keep_separator: bool = True,
         max_chunk_limit: int = 10000,
     ):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
-        self.separators = separators or ["\n\n", "\n", "。", ".", " ", ""]
+        self.separators = separators or ["\n\n", "\n", "。", "！", "？", "；", ".", " ", ""]
         self.is_separator_regex = is_separator_regex
         self.keep_separator = keep_separator
         self.max_chunk_limit = max_chunk_limit
@@ -149,15 +154,24 @@ class ChunkSplitter:
         if not base_chunks:
             return []
 
-        # 基础 chunk（不含 overlap）的位置：从原文精确定位
-        # 使用累积 offset,每个 base chunk 占原文 len(chunk) 字符
+        # 在原文中顺序 find 每个 chunk 的真实区间。
+        # 不能用 pos += len(chunk) 累加: base_chunks 已含 overlap 前缀 (前缀来自上一
+        # chunk 的尾部), len(chunk) 比核心正文多出 overlap, 累加会使后续 chunk 的
+        # start/end 随序号线性漂移 (chunk_overlap=100 时第 5 个 chunk 端点偏移约
+        # 500 字符), 让 IntervalSearch 把 bbox/page 归因到错误的元素。
+        # find 不受前缀影响: 前缀是上一核心的尾部, 与本核心在原文中连续, 故整个
+        # chunk (前缀+核心) 在原文中是一段连续区间, find 可精确定位。
         positions: list[tuple[str, int, int]] = []
-        pos = 0
+        search_offset = 0
         for chunk in base_chunks:
-            start = pos
-            end = pos + len(chunk)
+            start = text.find(chunk, search_offset)
+            if start == -1:
+                # 退化: 多层 overlap 拼接或原文被清洗后无法精确匹配, 用偏移估算
+                start = search_offset
+            end = min(start + len(chunk), len(text))
             positions.append((chunk, start, end))
-            pos = end  # 严格累加,不含 overlap（overlap 是相邻 chunk 间的共享区）
+            # 只推进 1 字符: 相邻 chunk 因 overlap 在原文中区间重叠, 不能跳过整段
+            search_offset = start + 1
 
         if self.chunk_overlap <= 0 or len(positions) <= 1:
             return positions
@@ -293,28 +307,29 @@ class ChunkSplitter:
         return [p for p in result if p]
 
     def _add_overlap(self, chunks: list[str]) -> list[str]:
-        """为相邻 chunk 添加重叠内容"""
+        """为相邻 chunk 添加单向重叠: 每个 chunk 前置上一 chunk 的尾部.
+
+        仅取前一个 chunk 的尾部作前缀 (单向), 不再同时追加后一个 chunk 的头部。
+        原因:
+        - 双向叠加会使一个满 chunk 实际长度膨胀到 chunk_size + 2*chunk_overlap
+          (chunk_size=500, overlap=100 时达 700), 既稀释该 chunk 的语义焦点,
+          又使 split_text_with_positions 用 len(chunk) 累加计算位置时持续偏移,
+          导致 bbox/page 溯源错位。
+        - 单向 overlap 已足以让相邻 chunk 在边界处共享上下文, 避免敏感信息被切到
+          两个 chunk 两侧都无法完整匹配 (与 md2rag.text_splitter._merge_splits
+          仅取 current[-chunk_overlap:] 的做法一致)。
+        """
         if self.chunk_overlap <= 0 or len(chunks) <= 1:
             return chunks
 
         overlapped: list[str] = []
         for i, chunk in enumerate(chunks):
             prefix = ""
-            suffix = ""
-
             if i > 0 and chunks[i - 1]:
                 # 从前一个 chunk 尾部取 overlap
                 prev = chunks[i - 1]
-                overlap_text = prev[-self.chunk_overlap:]
-                prefix = overlap_text
-
-            if i < len(chunks) - 1 and chunks[i + 1]:
-                # 从后一个 chunk 头部取 overlap
-                next_chunk = chunks[i + 1]
-                overlap_text = next_chunk[:self.chunk_overlap]
-                suffix = overlap_text
-
-            overlapped.append(prefix + chunk + suffix)
+                prefix = prev[-self.chunk_overlap:]
+            overlapped.append(prefix + chunk)
 
         return overlapped
 

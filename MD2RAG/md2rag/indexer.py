@@ -10,6 +10,11 @@
 7. 检索时：child 搜 → parent 回查
 
 输出：向量集合（每密级 2 个 collection：parent + child）+ 图片集合
+
+分批流式优化：
+- 分批入库，避免内存溢出
+- 流式处理，及时释放内存
+- 细粒度进度回调
 """
 
 from __future__ import annotations
@@ -20,15 +25,14 @@ import signal
 import sys
 import time
 import traceback
-import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from md2rag.bbox_extractor import build_line_index, get_bboxes_for_record
 from md2rag.config import MD2RAGConfig, load_config
 from md2rag.embedder import Embedder, create_embedder
+from md2rag.embedding_cache import IndexManifest
 from md2rag.image_processor import ImageProcessor, ViTImageEmbedder
 from md2rag.llm_summary import LLMClient, extract_abstract
 from md2rag.loader import (
@@ -36,8 +40,10 @@ from md2rag.loader import (
     VALID_CLASSIFICATIONS,
     ChunkLoader,
     ChunkRecord,
+    stable_doc_id,
 )
 from md2rag.logger import get_logger, log_step, log_timing, log_memory, setup_exception_logging
+from md2rag.memory_monitor import MemoryMonitor, memory_checkpoint, force_gc
 from md2rag.parent_child_retriever import ParentChildRetriever
 from md2rag.vector_store import VectorStore
 
@@ -45,6 +51,19 @@ from md2rag.vector_store import VectorStore
 setup_exception_logging()
 
 logger = get_logger("md2rag.indexer")
+
+
+# ------------------------------------------------------------------------
+# 配置常量
+# ------------------------------------------------------------------------
+
+# 分批入库配置
+# BATCH_SIZE_FILES 控制外层文件批 — 单文件已经是流式入库, 这里只决定多久打一次
+# RSS 日志/清理. 设小一点有助于在大文件密集时及时回收.
+BATCH_SIZE_FILES = 5
+BATCH_SIZE_EMBED = 128         # 每批嵌入文本数 - 2026-07-23 实测大批更快 (见 embedder._call_batch 注释)
+BATCH_SIZE_IMAGES = 8          # 图片单批数 — ViT-Large peak 内存大, 不宜过大
+MEMORY_CLEANUP_INTERVAL = 1    # 每批文件都清一次 (旧值 5, 大文件下太稀疏)
 
 
 # ------------------------------------------------------------------------
@@ -97,11 +116,6 @@ class IndexResult:
 
 
 # ------------------------------------------------------------------------
-# 密级映射统一在 md2rag.loader.CLASSIFICATION_DIR_MAP 维护,本文件不再持有副本。
-# ------------------------------------------------------------------------
-
-
-# ------------------------------------------------------------------------
 # 主索引器
 # ------------------------------------------------------------------------
 
@@ -112,13 +126,20 @@ class Indexer:
       X2MD .parents/.children.json  →  ChunkLoader  →  LLM摘要  →
       bbox 关联  →  Embedder  →  ParentChildRetriever (双 collection)  →
       VectorStore (ChromaDB)
+
+    分批流式优化:
+      - 分批入库，避免内存溢出
+      - 流式处理，及时释放内存
+      - 细粒度进度回调
     """
 
-    def __init__(self, config: Optional[MD2RAGConfig] = None):
+    def __init__(self, config: Optional[MD2RAGConfig] = None, enable_memory_monitor: bool = False):
         log_step(logger, "INIT", "Initializing Indexer...")
         init_start = time.time()
 
         self.config = config or MD2RAGConfig()
+        self.enable_memory_monitor = enable_memory_monitor
+        self._memory_monitor: Optional[MemoryMonitor] = None
         logger.info(f"[CONFIG] md_dir: {self.config.md_dir}")
         logger.info(f"[CONFIG] vector_db_dir: {self.config.vector_db_dir}")
         logger.info(f"[CONFIG] embedding_model: {self.config.embedding_model}")
@@ -135,6 +156,10 @@ class Indexer:
             collection_prefix=self.config.collection_prefix,
         )
 
+        # 增量索引清单: 记录已成功 embed+upsert 的 chunk 文件 (path+content_hash)。
+        # 重跑时跳过未变文件, 省 embed + ChromaDB upsert; 清库时联动 clear。
+        self._manifest = IndexManifest(self.config.vector_db_dir / "md2rag_index_manifest.sqlite")
+
         # Per-classification 父子检索器缓存
         self._retrievers: Dict[str, ParentChildRetriever] = {}
 
@@ -145,30 +170,44 @@ class Indexer:
         log_timing(logger, "Indexer initialization", elapsed_ms)
         log_step(logger, "INIT_COMPLETE", "Indexer ready")
 
+        # 启动内存监控
+        if self.enable_memory_monitor:
+            self._memory_monitor = MemoryMonitor(sample_interval=2.0)
+            self._memory_monitor.start()
+            logger.info("[MEMORY] Memory monitoring enabled")
+
     # ------------------------------------------------------------------
     # 工厂方法
     # ------------------------------------------------------------------
 
     def _create_embedder(self) -> Embedder:
-        """根据配置创建嵌入器."""
-        # 优先使用 MPS（如果配置为 mps 设备）
-        if self.config.device == "mps":
-            logger.info("[EMBEDDER] Using MPS embedder (Apple Silicon GPU)")
-            return create_embedder(
-                model_type="mps",
-                device="mps",
-            )
+        """根据配置创建嵌入器.
+
+        embedder 类型优先由 ollama_enabled 决定, 而非 device: 旧逻辑先判
+        device=="mps", 在 Apple Silicon 上 device=auto 会被 _detect_device()
+        解析为 "mps", 从而即使用户配置了 [ollama] enabled=true 也静默走
+        MPSEmbedder (且 MPS 路径有 512 token 截断), 造成入库向量与 Ollama
+        查询向量空间不一致。改判顺序后, 显式启用 Ollama 时一律走 Ollama;
+        MPS 仅在 Ollama 未启用时作为 Apple Silicon GPU 兜底。
+        """
         if self.config.ollama_enabled:
             return create_embedder(
                 model_type="ollama",
                 ollama_url=self.config.ollama_base_url,
                 ollama_model=self.config.ollama_model,
+                ollama_cache_path=str(self.config.vector_db_dir / "md2rag_embedding_cache.sqlite"),
             )
         if self.config.st_enabled:
             return create_embedder(
                 model_type="sentence-transformers",
                 st_model=self.config.st_model_name,
                 device=self.config.device,
+            )
+        if self.config.device == "mps":
+            logger.info("[EMBEDDER] Using MPS embedder (Apple Silicon GPU)")
+            return create_embedder(
+                model_type="mps",
+                device="mps",
             )
         return create_embedder(model_type="chromadb-default")
 
@@ -180,12 +219,14 @@ class Indexer:
     }
 
     def _resolve_embedder_name(self) -> str:
-        if self.config.device == "mps":
-            return "mps"
+        # 顺序须与 _create_embedder 一致, 否则 switch_embedder 的幂等判断和
+        # manifest 记录会与实际使用的 embedder 错位。
         if self.config.ollama_enabled:
             return "ollama-bge-m3" if self.config.ollama_model == "bge-m3:latest" else "ollama"
         if self.config.st_enabled:
             return "sentence-transformers"
+        if self.config.device == "mps":
+            return "mps"
         return "chromadb-default"
 
     def switch_embedder(self, embedding_model: str) -> None:
@@ -206,6 +247,7 @@ class Indexer:
             model_type=model_type,
             ollama_url=self.config.ollama_base_url,
             device=self.config.device,
+            ollama_cache_path=str(self.config.vector_db_dir / "md2rag_embedding_cache.sqlite") if model_type == "ollama" else None,
             **kwargs,
         )
         new_dim = new_embedder.dimension
@@ -218,6 +260,7 @@ class Indexer:
         self.store.embedder = new_embedder
         self._current_embedder_name = embedding_model
         self._retrievers.clear()  # 重建
+        self._manifest.clear()  # 换了 embedder, "已索引"记录失效, 下次重嵌 (同维度换模型也必须重嵌, 否则留旧模型向量)
         logger.info(f"[SWITCH] Embedder switched to {embedding_model}, dim={new_dim}")
 
     def _get_retriever(self, classification: str) -> ParentChildRetriever:
@@ -239,7 +282,70 @@ class Indexer:
             logger.info("[LLM] LLM client cleared")
 
     # ------------------------------------------------------------------
-    # 核心：索引目录
+    # 内存管理工具
+    # ------------------------------------------------------------------
+
+    def _cleanup_memory(self) -> None:
+        """清理内存缓存."""
+        # 记录检查点（如果监控启用）
+        if self._memory_monitor:
+            self._memory_monitor.checkpoint("before_cleanup")
+
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                try:
+                    torch.mps.empty_cache()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if self._memory_monitor:
+            self._memory_monitor.checkpoint("after_cleanup")
+
+    def _drop_classification_caches(self, classification: str) -> None:
+        """单密级入库完成后, 把该密级相关的 collection/retriever 句柄从缓存里丢掉.
+
+        VectorStore._collections / Indexer._retrievers 缓存的 ChromaDB Collection
+        对象内部带 HNSW writer 引用 (~MB 级常驻); ingest_all_levels 跨 3 个密级
+        共享同一 indexer 时, 不清理会让 9 个 collection (3 parent + 3 child + 3 images)
+        + 3 个 retriever 全程驻留, 显著抬高 RSS。
+        """
+        try:
+            self._retrievers.pop(classification, None)
+            # 与 ParentChildRetriever / vector_store 命名约定保持一致
+            prefix = self.config.collection_prefix
+            keys_to_drop = [
+                classification,
+                f"{prefix}_{classification}",
+                f"{prefix}_{classification}_parent",
+                f"{prefix}_{classification}_child",
+                f"{classification}_images",
+            ]
+            for k in keys_to_drop:
+                try:
+                    self.store._collections.pop(k, None)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"[CLEANUP] drop classification caches failed: {e}")
+
+    @staticmethod
+    def _log_rss(tag: str) -> None:
+        """轻量 RSS 打印 — 用于排查内存累积. psutil 不在时 silent skip."""
+        try:
+            import psutil, os
+            rss_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+            logger.info(f"[RSS] {tag}: {rss_mb:.1f} MB")
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # 核心：索引目录 (分批流式版)
     # ------------------------------------------------------------------
 
     def index_directory(
@@ -248,14 +354,17 @@ class Indexer:
         strategy: str = "auto",
         regenerate_abstract: bool = False,
         include_images: bool = True,
+        progress_callback: Optional[Callable[[Dict], None]] = None,
+        cancel_event=None,
     ) -> IndexResult:
-        """索引 MD 目录下所有切片文件.
+        """索引 MD 目录下所有切片文件 (分批流式版).
 
         Args:
             classification: 指定密级，None 时扫描所有
             strategy: 切片策略 auto/chunk/parent-child
             regenerate_abstract: 是否用 LLM 重新生成 abstract
             include_images: 是否同时处理图片（ViT-Large）
+            progress_callback: 进度回调函数，接收 {"phase": ..., "progress": ..., "message": ...}
 
         Returns:
             IndexResult
@@ -267,8 +376,19 @@ class Indexer:
 
         result = IndexResult()
 
+        def report_progress(phase: str, progress: float, message: str):
+            """统一的进度报告函数."""
+            if progress_callback:
+                progress_callback({
+                    "phase": phase,
+                    "progress": progress,
+                    "message": message,
+                })
+            logger.info(f"[PROGRESS] {phase}: {progress*100:.1f}% - {message}")
+
         try:
             # 1. 发现文件
+            report_progress("discovering", 0.0, "正在扫描文件...")
             chunk_files = self.loader.discover_files(classification)
             if not chunk_files:
                 result.status = "empty"
@@ -276,61 +396,85 @@ class Indexer:
                 logger.warning(result.message)
                 return result
 
-            logger.info(f"[FILES] Discovered {len(chunk_files)} chunk files")
+            total_files = len(chunk_files)
+            logger.info(f"[FILES] Discovered {total_files} chunk files")
+            report_progress("discovering", 1.0, f"发现 {total_files} 个文件")
 
-            # 2. 加载所有文件（串行加载，避免 ThreadPoolExecutor 嵌套冲突）
-            all_records_by_file: Dict[Path, List[ChunkRecord]] = {}
-            load_errors: List[str] = []
-            for i, fp in enumerate(chunk_files):
-                try:
-                    records = self.loader.load_file(fp)
-                    if records:
-                        all_records_by_file[fp] = records
-                    if (i + 1) % 10 == 0:
-                        logger.info(f"[PROGRESS] Loaded {i + 1}/{len(chunk_files)} files")
-                except Exception as e:
-                    logger.error(f"[LOAD_ERROR] Failed to load {fp}: {e}")
-                    load_errors.append(f"{fp.name}: {e}")
-
-            result.errors.extend(load_errors)
-            total_records = sum(len(r) for r in all_records_by_file.values())
-            log_memory(logger, "Records loaded", total_records)
-
-            if not all_records_by_file:
-                result.status = "empty"
-                result.message = "No records loaded"
-                logger.warning(result.message)
-                return result
-
-            # 3. 按密级分组
-            by_class: Dict[str, Dict[str, List[ChunkRecord]]] = {}  # class -> {file_path: [records]}
-            for fp, records in all_records_by_file.items():
+            # 2. 按密级分组（只做路径分组，不加载内容）
+            by_class: Dict[str, List[Path]] = {}
+            for fp in chunk_files:
                 cls = classification or self.loader.get_classification_from_path(fp)
-                by_class.setdefault(cls, {}).setdefault(str(fp), []).extend(records)
+                by_class.setdefault(cls, []).append(fp)
 
-            # 4. 入库每个密级
-            for cls, file_records_map in by_class.items():
-                logger.info(f"[INDEX] Processing classification: {cls} ({len(file_records_map)} files)")
+            # 3. 按密级入库
+            total_classifications = len(by_class)
+            for cls_idx, (cls, files) in enumerate(by_class.items()):
+                # 协作式取消检查: 在每个密级开始前检查
+                if cancel_event and cancel_event.is_set():
+                    result.status = "cancelled"
+                    result.message = "索引操作被用户取消"
+                    logger.info("[CANCEL] Indexing cancelled by user")
+                    return result
+
+                cls_progress_base = cls_idx / total_classifications
+                cls_progress_range = 1.0 / total_classifications
+
+                logger.info(f"[INDEX] Processing classification: {cls} ({len(files)} files)")
+                report_progress(
+                    "indexing",
+                    cls_progress_base,
+                    f"开始处理 {cls} 密级 ({len(files)} 个文件)"
+                )
+
                 try:
-                    parents, children = self._index_classification(cls, file_records_map, regenerate_abstract)
+                    # ★ 分批入库
+                    parents, children = self._index_classification_batched(
+                        cls,
+                        files,
+                        regenerate_abstract,
+                        progress_callback=lambda p: report_progress(
+                            "indexing",
+                            cls_progress_base + p["progress"] * cls_progress_range,
+                            p["message"]
+                        ),
+                    )
                     result.parents_added += parents
                     result.children_added += children
-                    result.documents_processed += len(file_records_map)
+                    result.documents_processed += len(files)
                     logger.info(f"[INDEX] {cls}: +{parents} parents, +{children} children")
+
+                    # 每个密级处理完后清理内存:
+                    # 1) 丢弃本密级的 retriever/collection 句柄 (防 3 密级累积)
+                    # 2) 清 Ollama embedder LRU cache (避免单调增长)
+                    # 3) gc + torch 缓存
+                    self._drop_classification_caches(cls)
+                    try:
+                        if hasattr(self.embedder, "_cache"):
+                            self.embedder._cache.clear()  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                    self._cleanup_memory()
+
                 except Exception as e:
                     logger.critical(f"[CRITICAL] Failed to index classification {cls}: {e}", exc_info=True)
                     result.errors.append(f"classification {cls}: {e}")
 
-            # 5. 处理图片
+            # 4. 处理图片
             if include_images and self.config.vit_enabled:
+                report_progress("images", 0.9, "开始处理图片...")
                 try:
-                    logger.info("[IMAGES] Starting image indexing...")
-                    images_count = self._index_images(classification)
+                    images_count = self._index_images_batched(
+                        classification,
+                        progress_callback=lambda p: report_progress("images", 0.9 + p["progress"] * 0.1, p["message"])
+                    )
                     result.images_added = images_count
                     logger.info(f"[IMAGES] Indexed {images_count} images")
                 except Exception as e:
                     logger.error(f"[IMAGES] Failed: {e}", exc_info=True)
                     result.errors.append(f"images: {e}")
+
+                # 图片处理完后清理内存
+                self._cleanup_memory()
 
         except Exception as e:
             logger.critical(f"[CRITICAL] index_directory failed: {e}", exc_info=True)
@@ -350,6 +494,7 @@ class Indexer:
             f"{result.images_added} images"
         )
         log_step(logger, "INDEX_COMPLETE", result.message)
+        report_progress("complete", 1.0, result.message)
         return result
 
     def index_md_file(
@@ -359,11 +504,12 @@ class Indexer:
         strategy: str = "auto",
         regenerate_abstract: bool = False,
     ) -> IndexResult:
-        """索引单个 MD 切片文件.
+        """索引单个 MD 切片文件 (供 CLI `index-file` 命令使用).
 
-        与 index_directory 的区别: 仅加载并入库指定的单个 chunk 文件,
-        不扫描整个 md_dir, 也不处理图片。供 CLI `index-file` 命令使用
-        (此前 CLI 调用了不存在的方法, 导致该命令必抛 AttributeError)。
+        与 index_directory 的区别: 仅加载并入库指定单个 chunk 文件, 不扫描 md_dir,
+        也不处理图片。复用 _process_batch 的单文件流式入库 (_ingest_file_chunks
+        sub-batch 嵌入 + manifest mark_done + 异常隔离), 故内存占用恒定、与
+        index_directory 走同一代码路径, 不再各自维护一套入库逻辑。
 
         Args:
             md_file: 切片文件路径 (*.parents.json / *.children.json / *.chunks.json)
@@ -375,7 +521,6 @@ class Indexer:
         log_step(logger, "INDEX_MD_FILE", f"file={md_file}, classification={classification}, strategy={strategy}")
         logger.info("=" * 80)
         start = time.time()
-
         result = IndexResult()
 
         try:
@@ -399,8 +544,11 @@ class Indexer:
             logger.info(f"[INDEX] Processing classification: {cls} (1 file)")
 
             try:
-                parents, children = self._index_classification(
-                    cls, {str(file_path): records}, regenerate_abstract
+                retriever = self._get_retriever(cls)
+                # 单文件即一批: _process_batch 内部走 _ingest_file_chunks + manifest
+                # mark_done (成功才记, 异常不记 -> 下次重试) + finally 释放 records
+                parents, children = self._process_batch(
+                    cls, [(file_path, records)], retriever, regenerate_abstract
                 )
                 result.parents_added += parents
                 result.children_added += children
@@ -412,7 +560,6 @@ class Indexer:
                 result.message = f"Critical error: {e}"
                 result.errors.append(f"{file_path.name}: {e}")
                 return result
-
         except Exception as e:
             logger.critical(f"[CRITICAL] index_md_file failed: {e}", exc_info=True)
             result.status = "error"
@@ -430,256 +577,420 @@ class Indexer:
         log_step(logger, "INDEX_COMPLETE", result.message)
         return result
 
-    def _index_classification(
+    def _index_classification_batched(
         self,
         classification: str,
-        file_records_map: Dict[str, List[ChunkRecord]],
+        files: List[Path],
         regenerate_abstract: bool = False,
+        progress_callback: Optional[Callable[[Dict], None]] = None,
     ) -> Tuple[int, int]:
-        """入库单个密级下的所有切片（优化版：批量嵌入）."""
-        log_step(logger, "INDEX_CLASS", f"class={classification}, files={len(file_records_map)}")
+        """分批入库单个密级下的所有切片 (内存优化版).
+
+        关键优化:
+        1. 按文件分批处理，每批处理完后立即入库并释放内存
+        2. 嵌入也分批进行，避免一次性生成大量向量
+        3. 定期执行内存清理
+        """
+        log_step(logger, "INDEX_CLASS", f"class={classification}, files={len(files)}")
         retriever = self._get_retriever(classification)
 
         parents_total = 0
         children_total = 0
-        processed_files = 0
-        total_files = len(file_records_map)
+        total_files = len(files)
 
-        # 收集所有需要嵌入的数据，按类型分组
-        # 结构: [(record, meta_dict, id_str, type_str), ...]
-        # type_str: "parent" | "child" | "chunk"
-        embed_batch = []  # 批量嵌入的文本列表
-        embed_items = []  # 对应的元数据
+        def report_progress(progress: float, message: str):
+            if progress_callback:
+                progress_callback({"progress": progress, "message": message})
 
-        # 4.1 收集所有 records，按 doc_id 关联 parent 和 children
-        for file_path, records in file_records_map.items():
-            processed_files += 1
-            if processed_files % 10 == 0:
-                logger.info(f"[PROGRESS] {classification}: {processed_files}/{total_files} files processed")
+        # ★ 分批处理文件
+        for batch_start in range(0, total_files, BATCH_SIZE_FILES):
+            batch_end = min(batch_start + BATCH_SIZE_FILES, total_files)
+            batch_files = files[batch_start:batch_end]
+            batch_idx = batch_start // BATCH_SIZE_FILES + 1
+            total_batches = (total_files + BATCH_SIZE_FILES - 1) // BATCH_SIZE_FILES
 
-            # 分类：parent / child / 普通 chunk
-            parents = [r for r in records if r.is_parent]
-            children = [r for r in records if r.is_child]
-            chunks = [r for r in records if not r.is_parent and not r.is_child]
+            report_progress(
+                batch_start / total_files,
+                f"处理第 {batch_idx}/{total_batches} 批文件 ({batch_start+1}-{batch_end}/{total_files})"
+            )
 
-            # 读取 MD 原文用于 bbox 合成
-            md_path = self._md_path_from_chunk_path(Path(file_path))
-            source_text = ""
-            if md_path and md_path.exists():
+            # ★ 加载当前批次的文件（而非全部文件）
+            batch_records: List[Tuple[Path, List[ChunkRecord]]] = []
+            skipped_in_batch = 0
+            for fp in batch_files:
+                # 增量跳过: 内容未变且非重生成摘要 -> 直接跳过 (省 load + embed + upsert)
+                if not regenerate_abstract:
+                    try:
+                        fp_hash = IndexManifest.file_hash(fp)
+                        if self._manifest.is_done(str(fp), fp_hash):
+                            skipped_in_batch += 1
+                            continue
+                    except Exception as e:
+                        logger.warning(f"[SKIP_CHECK] hash/manifest check failed for {fp}: {e}")
                 try:
-                    source_text = md_path.read_text(encoding="utf-8", errors="replace")
+                    records = self.loader.load_file(fp)
+                    if records:
+                        batch_records.append((fp, records))
                 except Exception as e:
-                    logger.warning(f"[INDEX] Failed to read MD {md_path}: {e}")
+                    logger.error(f"[LOAD_ERROR] Failed to load {fp}: {e}")
+            if skipped_in_batch:
+                logger.info(f"[INDEX] batch{batch_idx}/{total_batches}: skipped {skipped_in_batch} unchanged file(s)")
 
-            # 行级索引每文件构建一次, 复用给本文件所有 parent/child (避免大文件 CPU 瓶颈)
-            line_index = build_line_index(source_text) if source_text else None
-
-            # 4.2 处理 parents
-            for p in parents:
-                if regenerate_abstract and self._llm_client:
-                    new_abs = extract_abstract(self._llm_client, p.text)
-                    if new_abs:
-                        p.abstract = new_abs
-
-                # bbox 关联
-                if not p.bbox and source_text:
-                    bboxes = get_bboxes_for_record(p.text, source_text, line_index=line_index)
-                    if bboxes:
-                        p.bbox = str(bboxes)
-
-                meta = p.to_metadata(classification, file_path)
-                doc_id = p.doc_id or str(uuid.uuid4())
-                meta["doc_id"] = doc_id
-                meta["parent_doc_id"] = doc_id
-
-                embed_batch.append(p.embedding_text)
-                embed_items.append({
-                    "record": p,
-                    "meta": meta,
-                    "id": doc_id,
-                    "type": "parent",
-                    "file_path": file_path,
-                })
-
-            # 4.3 处理 children
-            for c in children:
-                if regenerate_abstract and self._llm_client and not c.abstract:
-                    new_abs = extract_abstract(self._llm_client, c.text)
-                    if new_abs:
-                        c.abstract = new_abs
-
-                if not c.bbox and source_text:
-                    bboxes = get_bboxes_for_record(c.text, source_text, line_index=line_index)
-                    if bboxes:
-                        c.bbox = str(bboxes)
-
-                meta = c.to_metadata(classification, file_path)
-                meta["parent_doc_id"] = c.parent_doc_id or c.doc_id
-                meta["is_child"] = True
-
-                child_id = f"{meta['parent_doc_id']}_child_{c.chunk_index}"
-                embed_batch.append(c.embedding_text)
-                embed_items.append({
-                    "record": c,
-                    "meta": meta,
-                    "id": child_id,
-                    "type": "child",
-                    "file_path": file_path,
-                })
-
-            # 4.4 处理普通 chunks（无 parent/child 关系的）
-            for ch in chunks:
-                meta = ch.to_metadata(classification, file_path)
-                doc_id = ch.doc_id or str(uuid.uuid4())
-                meta["doc_id"] = doc_id
-                meta["parent_doc_id"] = doc_id
-                meta["is_parent"] = True
-                meta["is_child"] = False
-
-                embed_batch.append(ch.embedding_text)
-                embed_items.append({
-                    "record": ch,
-                    "meta": meta,
-                    "id": doc_id,
-                    "type": "chunk",
-                    "file_path": file_path,
-                })
-
-        # 4.5 批量嵌入所有文本
-        if not embed_batch:
-            logger.info(f"[INDEX_CLASS] {classification}: No items to embed")
-            return 0, 0
-
-        logger.info(f"[INDEX_CLASS] {classification}: Embedding {len(embed_batch)} items in batch...")
-        try:
-            all_embeddings = self.embedder.embed(embed_batch)
-            if not all_embeddings or len(all_embeddings) != len(embed_batch):
-                logger.error(f"[INDEX] Batch embedding failed: expected {len(embed_batch)}, got {len(all_embeddings) if all_embeddings else 0}")
-                return parents_total, children_total
-        except Exception as e:
-            logger.error(f"[INDEX] Batch embedding failed: {e}")
-            return parents_total, children_total
-
-        # 4.6 将嵌入结果入库
-        parent_chunks = []
-        child_chunks = []
-        parent_embeddings = []
-        child_embeddings = []
-        parent_ids = []
-        child_ids = []
-
-        for i, item in enumerate(embed_items):
-            emb = all_embeddings[i]
-            if not emb:
-                logger.error(f"[INDEX] Empty embedding for {item['type']} {item['record'].source}#{item['record'].chunk_index}")
+            if not batch_records:
                 continue
 
-            if item["type"] == "parent" or item["type"] == "chunk":
-                parent_chunks.append((item["record"].embedding_text, item["meta"]))
-                parent_embeddings.append(emb)
-                parent_ids.append(item["id"])
-                parents_total += 1
-            elif item["type"] == "child":
-                child_chunks.append((item["record"].embedding_text, item["meta"]))
-                child_embeddings.append(emb)
-                child_ids.append(item["id"])
-                children_total += 1
+            # 处理当前批次
+            parents, children = self._process_batch(
+                classification,
+                batch_records,
+                retriever,
+                regenerate_abstract,
+            )
+            parents_total += parents
+            children_total += children
 
-        # 批量入库
-        if parent_chunks:
-            try:
-                retriever.add_parent_chunks(parent_chunks, embeddings=parent_embeddings, ids=parent_ids)
-                logger.info(f"[INDEX] Added {len(parent_chunks)} parent/chunk items")
-            except Exception as e:
-                logger.error(f"[INDEX] Failed to add parent chunks: {e}")
+            # ★ 每批处理完后立即清理内存
+            del batch_records
+            if (batch_idx % MEMORY_CLEANUP_INTERVAL == 0) or (batch_end == total_files):
+                self._cleanup_memory()
+                self._log_rss(f"{classification} batch{batch_idx}/{total_batches} done "
+                              f"(+{parents_total}p +{children_total}c)")
 
-        if child_chunks:
-            try:
-                retriever.add_child_chunks(child_chunks, embeddings=child_embeddings, ids=child_ids)
-                logger.info(f"[INDEX] Added {len(child_chunks)} child items")
-            except Exception as e:
-                logger.error(f"[INDEX] Failed to add child chunks: {e}")
-
+        report_progress(1.0, f"完成 {classification} 密级入库")
         logger.info(f"[INDEX_CLASS_COMPLETE] {classification}: {parents_total} parents, {children_total} children")
+        return parents_total, children_total
+
+    def _process_batch(
+        self,
+        classification: str,
+        batch_records: List[Tuple[Path, List[ChunkRecord]]],
+        retriever: ParentChildRetriever,
+        regenerate_abstract: bool = False,
+    ) -> Tuple[int, int]:
+        """处理单个文件批次 — 按文件级别立即流式入库, 不再跨文件累积.
+
+        ★ 关键修复 (内存): 单文件 sub-batch 化
+        - 历史上本方法把 BATCH_SIZE_FILES=20 个文件的所有 chunk 全部塞进 embed_batch
+          后再分 sub-batch 嵌入。当其中一个文件是大文件 (例: 6MB children.json,
+          ~5000-10000 chunks), 整批 chunk 文本会全部驻留到本批结束, peak 内存
+          可达数百 MB; 长跑入库到几千条就 OOM。
+        - 现在: 每个文件独立调用 _ingest_file_chunks, 解析 → sub-batch 嵌入 → 入库
+          → 释放, 全程占用恒定于"单 sub-batch 的 embedding 大小" (BATCH_SIZE_EMBED
+          × 1024 dim ≈ 200KB), 与文件大小完全无关。
+        """
+        parents_total = 0
+        children_total = 0
+
+        for file_path, records in batch_records:
+            try:
+                p, c = self._ingest_file_chunks(
+                    classification, file_path, records, retriever, regenerate_abstract
+                )
+                parents_total += p
+                children_total += c
+                # 成功 (embed+upsert 全过) 才记 manifest -> 下次跳过; 异常不记 -> 重试
+                try:
+                    self._manifest.mark_done(str(file_path), IndexManifest.file_hash(file_path), classification)
+                except Exception as me:
+                    logger.warning(f"[MANIFEST] mark_done failed for {file_path}: {me}")
+            except Exception as e:
+                logger.error(f"[INDEX] Failed processing file {file_path}: {e}", exc_info=True)
+            finally:
+                # 文件级释放: ChunkRecord 列表 (含 text/abstract/raw_metadata 整片) 立即丢弃
+                records.clear() if isinstance(records, list) else None
+
+        return parents_total, children_total
+
+    def _ingest_file_chunks(
+        self,
+        classification: str,
+        file_path: Path,
+        records: List[ChunkRecord],
+        retriever: ParentChildRetriever,
+        regenerate_abstract: bool,
+    ) -> Tuple[int, int]:
+        """单文件: 解析 → sub-batch 嵌入 → 入库 → 释放. 全程恒定内存."""
+        # 分类：parent / child / 普通 chunk
+        parents = [r for r in records if r.is_parent]
+        children = [r for r in records if r.is_child]
+        chunks = [r for r in records if not r.is_parent and not r.is_child]
+
+        # 读取 MD 原文用于 bbox 合成 — 仅本文件作用域, 出函数立即释放
+        md_path = self._md_path_from_chunk_path(Path(file_path))
+        source_text = ""
+        if md_path and md_path.exists():
+            try:
+                source_text = md_path.read_text(encoding="utf-8", errors="replace")
+            except Exception as e:
+                logger.warning(f"[INDEX] Failed to read MD {md_path}: {e}")
+
+        # 行级索引每文件构建一次, 复用给本文件所有 parent/child,
+        # 避免旧实现每条 chunk 都 make_synthetic_bboxes + 线性扫描 (大文件 CPU 瓶颈).
+        line_index = build_line_index(source_text) if source_text else None
+
+        # 构造轻量 embed items (不持 ChunkRecord 引用)
+        embed_items: List[Dict[str, Any]] = []
+
+        for p in parents:
+            if regenerate_abstract and self._llm_client:
+                new_abs = extract_abstract(self._llm_client, p.text)
+                if new_abs:
+                    p.abstract = new_abs
+            if not p.bbox and source_text:
+                bboxes = get_bboxes_for_record(p.text, source_text, line_index=line_index)
+                if bboxes:
+                    p.bbox = str(bboxes)
+            meta = p.to_metadata(classification, str(file_path))
+            doc_id = p.doc_id or stable_doc_id(p.source, p.chunk_index, kind="parent")
+            meta["doc_id"] = doc_id
+            meta["parent_doc_id"] = doc_id
+            embed_items.append({
+                "embedding_text": p.embedding_text,
+                "meta": meta,
+                "id": doc_id,
+                "type": "parent",
+            })
+
+        for c in children:
+            if regenerate_abstract and self._llm_client and not c.abstract:
+                new_abs = extract_abstract(self._llm_client, c.text)
+                if new_abs:
+                    c.abstract = new_abs
+            if not c.bbox and source_text:
+                bboxes = get_bboxes_for_record(c.text, source_text, line_index=line_index)
+                if bboxes:
+                    c.bbox = str(bboxes)
+            meta = c.to_metadata(classification, str(file_path))
+            meta["parent_doc_id"] = c.parent_doc_id or c.doc_id
+            meta["is_child"] = True
+            child_id = f"{meta['parent_doc_id']}_child_{c.chunk_index}"
+            embed_items.append({
+                "embedding_text": c.embedding_text,
+                "meta": meta,
+                "id": child_id,
+                "type": "child",
+            })
+
+        for ch in chunks:
+            meta = ch.to_metadata(classification, str(file_path))
+            doc_id = ch.doc_id or stable_doc_id(ch.source, ch.chunk_index, kind="chunk")
+            meta["doc_id"] = doc_id
+            meta["parent_doc_id"] = doc_id
+            meta["is_parent"] = True
+            meta["is_child"] = False
+            embed_items.append({
+                "embedding_text": ch.embedding_text,
+                "meta": meta,
+                "id": doc_id,
+                "type": "chunk",
+            })
+
+        # 释放 ChunkRecord 列表 + source_text — bbox/abstract 已经物化到 meta 里
+        parents.clear()
+        children.clear()
+        chunks.clear()
+        source_text = ""
+
+        if not embed_items:
+            return 0, 0
+
+        parents_total = 0
+        children_total = 0
+        total = len(embed_items)
+
+        # ★ sub-batch 流式: 即使本文件有 5000 chunk, peak 也只是单 sub-batch
+        for embed_start in range(0, total, BATCH_SIZE_EMBED):
+            embed_end = min(embed_start + BATCH_SIZE_EMBED, total)
+            batch_items = embed_items[embed_start:embed_end]
+            batch_texts = [it["embedding_text"] for it in batch_items]
+
+            try:
+                embeddings = self.embedder.embed(batch_texts)
+                if not embeddings or len(embeddings) != len(batch_texts):
+                    logger.error(
+                        f"[INDEX] Embed mismatch in {Path(file_path).name} "
+                        f"[{embed_start}-{embed_end}]: expected {len(batch_texts)}, "
+                        f"got {len(embeddings) if embeddings else 0}"
+                    )
+                    # 已处理槽位置 None, 进入下一批
+                    for j in range(embed_start, embed_end):
+                        embed_items[j] = None  # type: ignore
+                    batch_texts = None
+                    continue
+            except Exception as e:
+                logger.error(f"[INDEX] Embed failed in {Path(file_path).name} "
+                             f"[{embed_start}-{embed_end}]: {e}")
+                for j in range(embed_start, embed_end):
+                    embed_items[j] = None  # type: ignore
+                batch_texts = None
+                continue
+
+            # 入库 — 全部局部, 出循环即释放
+            parent_chunks: List[Tuple[str, Dict[str, Any]]] = []
+            child_chunks: List[Tuple[str, Dict[str, Any]]] = []
+            parent_embeddings: List[List[float]] = []
+            child_embeddings: List[List[float]] = []
+            parent_ids: List[str] = []
+            child_ids: List[str] = []
+
+            for i, item in enumerate(batch_items):
+                emb = embeddings[i]
+                if not emb:
+                    continue
+                if item["type"] == "parent" or item["type"] == "chunk":
+                    parent_chunks.append((item["embedding_text"], item["meta"]))
+                    parent_embeddings.append(emb)
+                    parent_ids.append(item["id"])
+                    parents_total += 1
+                elif item["type"] == "child":
+                    child_chunks.append((item["embedding_text"], item["meta"]))
+                    child_embeddings.append(emb)
+                    child_ids.append(item["id"])
+                    children_total += 1
+
+            if parent_chunks:
+                try:
+                    retriever.add_parent_chunks(parent_chunks, embeddings=parent_embeddings, ids=parent_ids)
+                except Exception as e:
+                    logger.error(f"[INDEX] add_parent_chunks failed: {e}")
+            if child_chunks:
+                try:
+                    retriever.add_child_chunks(child_chunks, embeddings=child_embeddings, ids=child_ids)
+                except Exception as e:
+                    logger.error(f"[INDEX] add_child_chunks failed: {e}")
+
+            # 本 sub-batch 的所有引用归零, 加 del 帮 CPython 即时 refcount=0
+            for j in range(embed_start, embed_end):
+                embed_items[j] = None  # type: ignore
+            del parent_chunks, child_chunks, parent_embeddings, child_embeddings
+            del parent_ids, child_ids, embeddings, batch_texts, batch_items
+
+        # 文件结束: embed_items 已全 None, 显式清掉 list 本身
+        embed_items.clear()
         return parents_total, children_total
 
     def _md_path_from_chunk_path(self, chunk_path: Path) -> Optional[Path]:
         """从 .parents.json / .children.json / .chunks.json 反推 MD 原文路径."""
-        # 路径形如: MD/0Public/银渐层.md/银渐层.parents.json
-        # MD 原文:   MD/0Public/银渐层.md/银渐层.md
         if chunk_path.suffixes[-2] in (".parents", ".children", ".chunks"):
             stem = chunk_path.name.split(".")[0]  # "银渐层"
             return chunk_path.parent / f"{stem}.md"
         return None
 
     # ------------------------------------------------------------------
-    # 图片索引
+    # 图片索引 (分批流式版)
     # ------------------------------------------------------------------
 
-    def _index_images(self, classification: Optional[str] = None) -> int:
-        """用 ViT-Large 处理 MD 目录下的图片."""
+    def _index_images_batched(
+        self,
+        classification: Optional[str] = None,
+        progress_callback: Optional[Callable[[Dict], None]] = None,
+    ) -> int:
+        """用 ViT-Large 处理 MD 目录下的图片 (分批流式版).
+
+        ★ 内存优化: discover_images 是 generator, 用 islice 分批拉取,
+        避免 list(...) 把所有 ImageRecord 一次性物化到内存
+        (大目录下可能几千上万条, metadata + path 累积可观)。
+        """
+        from itertools import islice
+
         log_step(logger, "INDEX_IMAGES", f"Processing images (classification={classification})")
         start = time.time()
 
+        def report_progress(progress: float, message: str):
+            if progress_callback:
+                progress_callback({"progress": progress, "message": message})
+
         vit_embedder = None
         processor = None
-        records = None
         try:
-            # 先构造正确的 ViT embedder，再传给 ImageProcessor（避免使用默认参数下载远程模型）
+            # 创建 ViT embedder
             vit_embedder = ViTImageEmbedder(
                 model_name=self.config.vit_model,
                 device=self.config.vit_device,
             )
             processor = ImageProcessor(self.config.md_dir, embedder=vit_embedder)
-            records = processor.process_images(classification)
-            if not records:
-                logger.info("[IMAGES] No images found")
-                return 0
 
-            total_images = 0
-            for rec in records:
-                if rec.embedding is None:
-                    continue
-                meta = {
-                    "source": rec.image_path.name,
-                    "document_name": rec.source_md,
-                    "chunk_index": rec.image_index,
-                    "chunk_type": "image",
-                    "classification": rec.classification,
-                    "content_type": "image",
-                    "image_path": str(rec.image_path),
-                    "original_md_path": str(rec.image_path),
-                    "original_file_name": rec.source_md,
-                    "is_parent": False,
-                    "is_child": False,
-                    "doc_id": rec.image_id,
-                    "parent_doc_id": rec.image_id,
-                }
-                # store.get_or_create_collection() 内部会自动加 collection_prefix,
-                # 所以这里只传 "{cls}_images" 即可。
-                # 历史 bug(已根治): 之前在这里又拼了 prefix,导致 collection 实际名为
-                # md2rag_md2rag_{cls}_images (双前缀)。
-                image_collection_key = f"{rec.classification}_images"
+            # 发现图片 — 保持 generator, 不要 list()
+            report_progress(0.0, "扫描图片文件...")
+            image_iter = processor.discover_images(classification)
+
+            processed = 0
+            batch_idx = 0
+            report_progress(0.1, "开始分批处理图片")
+
+            while True:
+                # islice 流式取下一批, 处理完即被 GC
+                batch = list(islice(image_iter, BATCH_SIZE_IMAGES))
+                if not batch:
+                    break
+                batch_idx += 1
+
+                image_paths = [r.image_path for r in batch]
                 try:
-                    coll = self.store.get_or_create_collection(image_collection_key)
-                    coll.add(
-                        documents=[rec.embedding_text],
-                        embeddings=[rec.embedding],
-                        metadatas=[meta],
-                        ids=[rec.image_id],
-                    )
-                    total_images += 1
+                    embeddings, valid_paths = vit_embedder.embed_images(image_paths)
                 except Exception as e:
-                    logger.error(f"[IMAGES] Failed {rec.image_path.name}: {e}")
+                    logger.error(f"[IMAGES] Failed to embed batch {batch_idx}: {e}")
+                    continue
+
+                # 入库当前批次
+                # embed_images 跳过加载失败的图片, 返回 (embeddings, valid_paths) 1:1 对齐;
+                # 按路径匹配回 rec, 避免按位置错位赋值/写入错误向量。
+                emb_by_path = dict(zip(valid_paths, embeddings))
+                for rec in batch:
+                    rec.embedding = emb_by_path.get(rec.image_path)
+                    if rec.embedding is None:
+                        continue
+
+                    meta = {
+                        "source": rec.image_path.name,
+                        "document_name": rec.source_md,
+                        "chunk_index": rec.image_index,
+                        "chunk_type": "image",
+                        "classification": rec.classification,
+                        "content_type": "image",
+                        "image_path": str(rec.image_path),
+                        "original_md_path": str(rec.image_path),
+                        "original_file_name": rec.source_md,
+                        "is_parent": False,
+                        "is_child": False,
+                        "doc_id": rec.image_id,
+                        "parent_doc_id": rec.image_id,
+                    }
+                    image_collection_key = f"{rec.classification}_images"
+                    try:
+                        coll = self.store.get_or_create_collection(image_collection_key)
+                        coll.add(
+                            documents=[rec.embedding_text],
+                            embeddings=[rec.embedding],
+                            metadatas=[meta],
+                            ids=[rec.image_id],
+                        )
+                        processed += 1
+                    except Exception as e:
+                        logger.error(f"[IMAGES] Failed {rec.image_path.name}: {e}")
+
+                # 清理当前批次的嵌入数据 + batch 本身
+                del embeddings
+                del batch
+
+                report_progress(min(0.99, 0.1 + 0.9 * processed / max(processed + BATCH_SIZE_IMAGES, 1)),
+                                f"已处理 {processed} 张图片")
+
+                # 定期内存清理
+                if batch_idx % MEMORY_CLEANUP_INTERVAL == 0:
+                    self._cleanup_memory()
 
             elapsed_ms = (time.time() - start) * 1000
             log_timing(logger, "Index images", elapsed_ms)
-            return total_images
+            report_progress(1.0, f"完成图片入库: {processed} 张")
+            return processed
+
         finally:
+            # ★ 确保释放 ViT 模型
             if vit_embedder is not None:
                 vit_embedder.release()
-            records = None
             processor = None
+            self._cleanup_memory()
 
     # ------------------------------------------------------------------
     # 检索（便捷方法）
@@ -718,7 +1029,7 @@ class Indexer:
     # ------------------------------------------------------------------
 
     def release(self) -> None:
-        """释放入库期间持有的模型、ChromaDB client 和 PyTorch 缓存。"""
+        """释放入库期间持有的模型、ChromaDB client 和 PyTorch 缓存."""
         try:
             self._retrievers.clear()
             self._llm_client = None
@@ -727,18 +1038,13 @@ class Indexer:
             if hasattr(self.store, "close"):
                 self.store.close()
         finally:
-            gc.collect()
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                    try:
-                        torch.mps.empty_cache()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            self._cleanup_memory()
+
+            # 停止内存监控并生成报告
+            if self._memory_monitor:
+                self._memory_monitor.stop()
+                self._memory_monitor.report()
+                self._memory_monitor = None
 
     def get_stats(self) -> Dict[str, int]:
         """获取所有 collection 的统计.
@@ -765,8 +1071,6 @@ class Indexer:
         if classification:
             retriever = self._get_retriever(classification)
             retriever.clear()
-            # 主动清空 vector_store 缓存和 ChromaDB 底层 collection
-            # 用 _get_client() 触发初始化, 不能直接访问 _client (会是 None)
             try:
                 client = self.store._get_client()
             except Exception as e:
@@ -779,15 +1083,9 @@ class Indexer:
                 except Exception as e:
                     logger.warning(f"[CLEAR] Failed to delete {name}: {e}")
                 self.store._collections.pop(name, None)
-            # 原代码 pop(name, ...) 在循环外, name 残留最后一次值; 上面已在循环内 pop, 这里清空 retriever 缓存即可
             self._retrievers.pop(classification, None)
+            self._manifest.clear(classification)
         else:
-            # 全部清空: 枚举 ChromaDB 实际存在的全部 collection 后逐一删除
-            # 不再用硬编码名字列表 (此前的列表会漏掉 md2rag_md2rag_*_images 这类
-            # 前缀加倍的名字, 也漏掉外部写入的 legacy collection)
-            # store._client 是懒加载的, 必须用 _get_client() 触发初始化, 否则
-            # 直接访问 store._client 在用户"启动→直接清空"的路径上是 None,
-            # 后续 None.delete_collection() 会抛 AttributeError 被静默吞掉
             try:
                 client = self.store._get_client()
             except Exception as e:
@@ -811,9 +1109,9 @@ class Indexer:
                     logger.info(f"[CLEAR] Deleted collection: {name}")
                 except Exception as e:
                     failed += 1
-                    # 不再静默: 失败要让用户能从日志里看到
                     logger.warning(f"[CLEAR] Failed to delete collection {name}: {e}")
                 self.store._collections.pop(name, None)
             logger.info(f"[CLEAR] All-clear done: {deleted} deleted, {failed} failed")
             self._retrievers.clear()
             self.store._collections.clear()
+            self._manifest.clear()

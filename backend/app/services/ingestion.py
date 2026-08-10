@@ -35,30 +35,16 @@ class DataIngestionService:
     def __init__(self):
         self._indexer = None
         self._md2rag_config = None
-        self._use_v2 = True  # 默认使用 V2 分批版本
         # 防 reset 并发 (双击 / 清空+切换模型 同时触发): 非阻塞获取,
         # 抢不到说明已有 reset 在跑, 直接返回 status="busy" 而非报错/partial。
         self._reset_lock = threading.Lock()
 
     def _get_indexer(self):
-        """延迟初始化 MD2RAG Indexer (V2 分批版本)."""
+        """延迟初始化 MD2RAG Indexer (原 V2 分批版本, 已合并为唯一实现)."""
         if self._indexer is not None:
             return self._indexer
 
-        # V2 分批版本优先
-        if self._use_v2:
-            try:
-                from md2rag.indexer_v2 import Indexer as IndexerV2
-                cfg = self._build_md2rag_config()
-                self._md2rag_config = cfg
-                self._indexer = IndexerV2(cfg)
-                return self._indexer
-            except ImportError as e:
-                # V2 不存在时回退到 V1
-                print(f"[INGEST] V2 indexer not available, fallback to V1: {e}")
-                self._use_v2 = False
-
-        # V1 原版
+        # indexer.py 已是合并后的分批流式版本 (原 indexer_v2), 不再有 V1/V2 分支
         from md2rag.indexer import Indexer
         cfg = self._build_md2rag_config()
         self._md2rag_config = cfg
@@ -66,7 +52,7 @@ class DataIngestionService:
         return self._indexer
 
     def _build_md2rag_config(self):
-        """构建 MD2RAG 配置对象 — V1/V2 共用的统一逻辑."""
+        """构建 MD2RAG 配置对象 — V1/V2 合并后的单一 Indexer 使用."""
         from md2rag.config import load_config as md2rag_load_config
 
         cfg = md2rag_load_config()

@@ -77,7 +77,9 @@ class ScannerService:
             count = collection.count()
             if count == 0:
                 continue
-            actual_n = min(3, count)
+            # 与 DocScan (n_results=10) 对齐: 原 min(3, count) 召回过低, 敏感 chunk
+            # 若排在 top4-10 会被整体漏检 (false negative)。
+            actual_n = min(10, count)
             # ★ 批量查询: 所有 chunk 的 embeddings 一次传入
             batch_results = collection.query(
                 query_embeddings=all_embeddings,

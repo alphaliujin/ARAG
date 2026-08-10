@@ -315,7 +315,13 @@ def combined_similarity(vec_sim: float, text_overlap: float, longest_run: int = 
 
 
 def adjust_similarity(raw_similarity: float) -> float:
-    """将原始 cosine similarity 重标定 — 全项目统一标准 (线性映射)."""
+    """将原始 cosine similarity 线性重标定 - 供 scanner / dedup 使用.
+
+    (raw - baseline)/(1 - baseline): raw=0.37(基线)->0, raw=1.0->1。
+    DocScan 比对不使用本函数, 改用 adjust_similarity_docscan (√映射, 放大低位信号)。
+    二者单调递增, 对"是否超阈值"判定等价, 但数值尺度不同, 故 scanner 阈值与
+    DocScan 显示阈值 (display_threshold_for_level) 不可直接互换。
+    """
     return max(0.0, (raw_similarity - BGE_M3_BASELINE) / (1.0 - BGE_M3_BASELINE))
 
 
@@ -339,6 +345,28 @@ def adjust_similarity_docscan(raw_similarity: float) -> float:
     """
     t = max(0.0, (raw_similarity - BGE_M3_BASELINE) / (1.0 - BGE_M3_BASELINE))
     return math.sqrt(t)
+
+
+def display_threshold_for_level(level: str) -> float:
+    """返回某密级命中的显示阈值 (在 adjust_similarity_docscan 的 √ 尺度上).
+
+    DocScan 原先对所有密级用统一的 DocScanConfig.MATCH_DISPLAY_THRESHOLD (0.6),
+    完全忽略用户在 runtime_settings 配的 per-level 阈值 (SIMILARITY_THRESHOLD_*),
+    导致"设置"页调灵敏度对文件扫描无效。现按密级取 runtime 阈值并换算到 √ 尺度:
+    因 adjust_similarity_docscan 单调递增, m["sim"] >= 该值 等价于 raw_sim >= 原始阈值,
+    即严格按用户配置的相似度门槛过滤, 与 scanner (线性, 同样保序) 的判定一致。
+
+    public 非敏感密级, 无 runtime 阈值, 回退到 MATCH_DISPLAY_THRESHOLD。
+    """
+    if level == "confidential":
+        t = getattr(settings, "SIMILARITY_THRESHOLD_CONFIDENTIAL", None)
+    elif level == "restricted":
+        t = getattr(settings, "SIMILARITY_THRESHOLD_RESTRICTED", None)
+    else:
+        t = None
+    if t is None:
+        return DocScanConfig.MATCH_DISPLAY_THRESHOLD
+    return adjust_similarity_docscan(float(t))
 
 
 def format_vector(values: List[float]) -> str:
@@ -963,9 +991,8 @@ class DocScanService:
 
             # 摘要超阈值时, 把摘要级 best match 作为唯一一条命中记录返回
             abstract_matches: List[Dict[str, Any]] = []
-            threshold = DocScanConfig.MATCH_DISPLAY_THRESHOLD
             for level, m in abstract_best_match.items():
-                if m["sim"] >= threshold:
+                if m["sim"] >= display_threshold_for_level(level):
                     abstract_matches.append({
                         "scanned_chunk_type": "abstract",
                         "scanned_chunk_index": -1,
@@ -1255,13 +1282,12 @@ class DocScanService:
 
             _atomic_write_json(children_file, c_data)
 
-        # ─── 构建命中片段列表 (按相似度从高到低, 过滤 < MATCH_DISPLAY_THRESHOLD) ───
-        threshold = DocScanConfig.MATCH_DISPLAY_THRESHOLD
+        # ─── 构建命中片段列表 (按相似度从高到低, 按密级用 runtime 阈值过滤) ───
         matches: List[Dict[str, Any]] = []
 
         # 摘要级命中 (即使未触发 skip, 0.6~0.8 区间仍有信息量)
         for level, m in abstract_best_match.items():
-            if m["sim"] >= threshold:
+            if m["sim"] >= display_threshold_for_level(level):
                 matches.append({
                     "scanned_chunk_type": "abstract",
                     "scanned_chunk_index": -1,
@@ -1275,7 +1301,7 @@ class DocScanService:
         # 父块命中 (parent_best_match 仅在 parents_file 存在时才填充)
         if parents_file.exists() and p_data:
             for idx, m in parent_best_match.items():
-                if m["sim"] >= threshold:
+                if m["sim"] >= display_threshold_for_level(m["level"]):
                     matches.append({
                         "scanned_chunk_type": "parent",
                         "scanned_chunk_index": idx,
@@ -1289,7 +1315,7 @@ class DocScanService:
         # 子块命中 (child_best_match 仅在 children_file 存在时才填充)
         if children_file.exists() and c_data:
             for idx, m in child_best_match.items():
-                if m["sim"] >= threshold:
+                if m["sim"] >= display_threshold_for_level(m["level"]):
                     matches.append({
                         "scanned_chunk_type": "child",
                         "scanned_chunk_index": idx,

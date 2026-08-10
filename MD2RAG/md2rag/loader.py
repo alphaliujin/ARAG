@@ -10,6 +10,7 @@ X2MD 已把 DOC/PDF 等源文档转换为 MD + 三种切片 JSON：
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -101,6 +102,21 @@ class ChunkRecord:
             "original_md_path": str(file_path) if file_path else "",
             "original_file_name": md_base,
         }
+
+
+def stable_doc_id(source: str, chunk_index: int, kind: str = "") -> str:
+    """生成确定性兜底 doc_id (替代 uuid4 随机 ID), 保证重入库可复现.
+
+    X2MD 正常会为 parent/child 生成 UUID 并写入切片 metadata; 本函数仅在 doc_id
+    缺失时兜底。旧实现用 uuid4(): 每次重入库都生成新随机 ID, 使 collection.upsert(
+    ids=[doc_id]) 无法覆盖旧记录而是追加, 同一 chunk 在库中堆积多份过期向量,
+    污染 HNSW 索引并让检索可能返回过期结果。
+
+    kind 用于区分 parent/chunk 等, 防止同 source+chunk_index 但不同类型的块
+    生成相同兜底 ID (二者可能落入同一 collection)。
+    """
+    raw = f"{kind}::{source}::{chunk_index}".encode("utf-8")
+    return "auto_" + hashlib.sha256(raw).hexdigest()[:16]
 
 
 # classification key -> 实际目录名映射

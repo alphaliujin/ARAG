@@ -54,8 +54,8 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
     "chunk": {
         "chunk_size": "500",
         "chunk_overlap": "0",
-        "separators": "\\n\\n,\\n,。,., ,",
-        "separator_rule": "after,after,after,after,after,after",
+        "separators": "\\n\\n,\\n,。,！,？,；,., ,",
+        "separator_rule": "after,after,after,after,after,after,after,after,after",
         "max_chunk_limit": "10000",
         "inject_abstract": "true",
     },
@@ -232,7 +232,7 @@ class Config:
     def chunk_separators(self) -> list[str]:
         raw = self._parser.get("chunk", "separators", fallback=None)
         if raw is None:
-            return ["\n\n", "\n", "。", ".", " ", ""]
+            return ["\n\n", "\n", "。", "！", "？", "；", ".", " ", ""]
         parts = raw.split(",")
         result: list[str] = []
         for p in parts:
@@ -247,9 +247,9 @@ class Config:
 
     @property
     def chunk_separator_rule(self) -> list[str]:
-        raw = self.get("chunk", "separator_rule", "after,after,after,after,after,after")
+        raw = self.get("chunk", "separator_rule", "after,after,after,after,after,after,after,after,after")
         parts = [p.strip() for p in raw.split(",")]
-        return parts if parts else ["after", "after", "after", "after", "after", "after"]
+        return parts if parts else ["after", "after", "after", "after", "after", "after", "after", "after", "after"]
 
     @property
     def chunk_max_limit(self) -> int:
