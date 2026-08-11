@@ -78,6 +78,10 @@ class Embedder(ABC):
         """释放模型/缓存资源。默认无状态嵌入器无需处理。"""
         return None
 
+    def clear_cache(self) -> None:
+        """清空内存缓存 (用于分密级索引间隙释放)。默认无内存缓存的嵌入器无需处理。"""
+        return None
+
 
 class ChromaDefaultEmbedder(Embedder):
     """ChromaDB 默认嵌入 (all-MiniLM-L6-v2)."""
@@ -429,6 +433,11 @@ class OllamaEmbedder(Embedder):
             self._dimension = len(sample)
             logger.info(f"[DIMENSION] Ollama embedder dimension: {self._dimension}")
         return self._dimension
+
+    def clear_cache(self) -> None:
+        # 仅清内存 LRU (跨密级索引间隙释放, 防单调增长); 不动 _disk_cache
+        # (磁盘缓存跨进程重启复用, 释放由 release() 负责)
+        self._cache.clear()
 
     def release(self) -> None:
         # Ollama embedder 本身无模型权重 (走 HTTP), 但维护一个 in-memory LRU

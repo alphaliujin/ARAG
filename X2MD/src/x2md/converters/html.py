@@ -169,13 +169,16 @@ class HtmlConverter(BaseConverter):
             return
 
         if tag_name == "p":
-            text = element.get_text(strip=True)
+            # 用 _inline_walk 递归收集内联格式 (bold/italic/links/code),
+            # 而非 get_text() -- 后者把 <strong>/<a>/<em> 全部展平为纯文本,
+            # 丢失加粗/斜体/链接, 且内联 <a> 永不触发 href 白名单 (XSS 风险)。
+            text = "".join(self._inline_walk(c) for c in element.children).strip()
             if text:
                 parts.append(text)
             return
 
         if tag_name == "li":
-            text = element.get_text(strip=True)
+            text = "".join(self._inline_walk(c) for c in element.children).strip()
             if text:
                 parts.append(f"- {text}")
             return
@@ -237,6 +240,39 @@ class HtmlConverter(BaseConverter):
 
         for child in element.children:
             self._walk(child, parts)
+
+    def _inline_walk(self, element) -> str:
+        """递归收集内联元素为带 Markdown 格式的字符串。
+
+        供 p/li 等容器使用, 替代 get_text() (后者展平所有子标签, 丢失
+        bold/italic/links/code)。内联 <a> 在此走 href 协议白名单。
+        """
+        # NavigableString (bs4 文本节点) 是 str 子类
+        if isinstance(element, str):
+            return str(element)
+        tag = element.name
+        if tag in ("strong", "b"):
+            inner = "".join(self._inline_walk(c) for c in element.children)
+            return f"**{inner}**" if inner.strip() else ""
+        if tag in ("em", "i"):
+            inner = "".join(self._inline_walk(c) for c in element.children)
+            return f"*{inner}*" if inner.strip() else ""
+        if tag == "code":
+            inner = element.get_text()
+            return f"`{inner}`" if inner else ""
+        if tag == "a":
+            href = element.get("href", "")
+            text = "".join(self._inline_walk(c) for c in element.children).strip()
+            if text and href:
+                # 协议白名单: 与 _walk 中 <a> 处理一致, 阻止 javascript:/data: 等
+                if href.startswith(("http://", "https://", "mailto:", "#", "ftp://")):
+                    return f"[{text}]({href})"
+                return text  # 不安全协议仅保留链接文本
+            return text
+        if tag == "br":
+            return "\n"
+        # 其他内联标签 (span/sub/sup/u 等): 递归子节点
+        return "".join(self._inline_walk(c) for c in element.children)
 
     def _convert_table(self, table, parts: list[str]):
         rows = []

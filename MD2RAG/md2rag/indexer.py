@@ -449,8 +449,7 @@ class Indexer:
                     # 3) gc + torch 缓存
                     self._drop_classification_caches(cls)
                     try:
-                        if hasattr(self.embedder, "_cache"):
-                            self.embedder._cache.clear()  # type: ignore[attr-defined]
+                        self.embedder.clear_cache()
                     except Exception:
                         pass
                     self._cleanup_memory()
