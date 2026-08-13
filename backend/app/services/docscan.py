@@ -1441,9 +1441,14 @@ class DocScanService:
         files = [f for f in docscan_dir.iterdir()
                  if f.is_file() and not f.name.startswith('.')]
 
-        # 一次 iterdir 收集所有 .parents.json 的 stem, 避免逐文件调 get_file_status
-        # 各自再 iterdir 搜源文件 (O(N²) 目录扫描)。stats 遍历的是真实源文件,
-        # f.stem 即 actual_stem, 直接用集合 membership 判定是否已预处理。
+        # 辅助切片 JSON 不计入 total_files (非文档), 也不作为文档计数
+        AUX_SUFFIXES = (".parents.json", ".children.json")
+        doc_files = [f for f in files if not f.name.endswith(AUX_SUFFIXES)]
+
+        # 一次 iterdir 收集所有 .parents.json 的 stem (每个 = 一个已预处理文档)。
+        # 避免逐文件调 get_file_status 各自 iterdir 搜源文件 (O(N²) 目录扫描)。
+        # ★ 按 stem 去重遍历: report.pdf 与 report.md 同 stem, 只算一个文档
+        # (旧实现遍历 files, 两者都命中 parents_stems, preprocessed/embedded/compared 翻倍)。
         parents_stems = {
             f.name[:-len(".parents.json")]
             for f in files
@@ -1453,12 +1458,9 @@ class DocScanService:
         preprocessed = 0
         embedded = 0
         compared = 0
-        for f in files:
-            stem = f.stem
-            if stem not in parents_stems:
-                continue
+        for stem in parents_stems:
             preprocessed += 1
-            # embedded/compared 需读 parents.json[0]["vector"] 标记 (仅对已预处理文件)
+            # embedded/compared 需读 parents.json[0]["vector"] 标记
             parents_file = docscan_dir / f"{stem}.parents.json"
             try:
                 p_data = json.loads(parents_file.read_text(encoding="utf-8"))
@@ -1474,7 +1476,7 @@ class DocScanService:
                 pass
 
         return {
-            "total_files": len(files),
+            "total_files": len(doc_files),
             "preprocessed": preprocessed,
             "embedded": embedded,
             "compared": compared,

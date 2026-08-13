@@ -922,6 +922,15 @@ class DataDeduplicationService:
                     else:
                         adj_sim = 0.0
                     if adj_sim >= dedup_threshold and m.get("source_chunk_id"):
+                        # n-gram 防护: 与 run_deduplication 自动去重一致 (line 597-599),
+                        # 跳过低字面重叠的样板误报 (高向量相似但 text_overlap<0.3 且
+                        # longest_run<30 多为 boilerplate/同领域不同内容, 不该自动删)。
+                        # JSON 由 _write_json 写入时带这两个字段 (line 739-740); 旧 JSON
+                        # 缺字段时默认 0.0/0 -> 跳过 (保守, 误删比漏删代价大)。
+                        text_overlap = m.get("text_overlap", 0.0)
+                        longest_run = m.get("longest_run", 0)
+                        if text_overlap < 0.3 and longest_run < 30:
+                            continue
                         ids_by_cls.setdefault(source_cls, set()).add(m["source_chunk_id"])
                         total_items += 1
 
