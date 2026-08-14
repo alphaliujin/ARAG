@@ -772,9 +772,14 @@ class Indexer:
                 if bboxes:
                     c.bbox = str(bboxes)
             meta = c.to_metadata(classification, str(file_path))
-            meta["parent_doc_id"] = c.parent_doc_id or c.doc_id
+            # ★ parent_doc_id 与 doc_id 都缺失时必须按 source 生成确定性兜底,
+            # 否则两个文件的 child 会生成相同的 "None_child_0" -> upsert 互相覆盖,
+            # 后入库的覆盖先入库的, 只剩一个文件的子块。
+            parent_doc_id = c.parent_doc_id or c.doc_id or \
+                stable_doc_id(c.source, c.chunk_index, kind="parent")
+            meta["parent_doc_id"] = parent_doc_id
             meta["is_child"] = True
-            child_id = f"{meta['parent_doc_id']}_child_{c.chunk_index}"
+            child_id = f"{parent_doc_id}_child_{c.chunk_index}"
             embed_items.append({
                 "embedding_text": c.embedding_text,
                 "meta": meta,

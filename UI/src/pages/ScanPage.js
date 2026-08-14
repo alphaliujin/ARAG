@@ -616,7 +616,7 @@ const ScanPage = () => {
           </p>
         </Dragger>
 
-        {/* 操作按钮 */}
+        {/* 操作按钮 (依赖选中文件) */}
         {selectedFile && (
           <div className="card" style={{ marginTop: '16px' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -653,17 +653,20 @@ const ScanPage = () => {
                   比对
                 </Button>
               </Space>
-              {opLoading.embed && (
-                <div style={{ marginTop: 12 }}>
-                  <Progress percent={embedProgress} size="small" status="active" />
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 }}>
-                    <span style={{ color: '#666', fontSize: 12 }}>{embedMessage}</span>
-                    <Button size="small" danger icon={<StopOutlined />} onClick={handleStopEmbed}>
-                      停止
-                    </Button>
-                  </div>
-                </div>
-              )}
+            </div>
+          </div>
+        )}
+
+        {/* 生成向量进度/停止: 独立于 selectedFile, 页面刷新后恢复中的任务也要能
+            看到进度并可停止 (旧实现包在 selectedFile && 里, 刷新后恒不渲染) */}
+        {opLoading.embed && (
+          <div className="card" style={{ marginTop: '16px' }}>
+            <Progress percent={embedProgress} size="small" status="active" />
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 }}>
+              <span style={{ color: '#666', fontSize: 12 }}>{embedMessage}</span>
+              <Button size="small" danger icon={<StopOutlined />} onClick={handleStopEmbed}>
+                停止
+              </Button>
             </div>
           </div>
         )}

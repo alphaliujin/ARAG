@@ -30,6 +30,19 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
     # /reset /dedup/apply 等敏感路由, 利于侦察。开发期 AUTH_DISABLED=True 时仍可访问。
     PUBLIC_PATHS = ("/", "/health")
 
+    # 前缀放行的前端静态资源 (部署模式单进程同源, main.py 把 UI/build mount 在 /):
+    # React 产物 /static/js|css|media/*、favicon、manifest 等必须公开, 否则浏览器
+    # 静态资源无法携带 X-API-Key header, 启用认证后 UI 白屏。API 路由 (/api/v1/*、
+    # /reset、/tasks/* 等) 均不以这些前缀开头, 不受影响。
+    PUBLIC_PREFIXES = (
+        "/static",
+        "/favicon.ico",
+        "/index.html",
+        "/manifest.json",
+        "/logo",
+        "/robots.txt",
+    )
+
     _startup_warned = False
 
     async def dispatch(self, request: Request, call_next):
@@ -50,9 +63,9 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
                 self._startup_warned = True
             return await call_next(request)
 
-        # 公开路由免认证
+        # 公开路由免认证 (精确匹配 + 静态资源前缀)
         path = request.url.path
-        if path in self.PUBLIC_PATHS:
+        if path in self.PUBLIC_PATHS or any(path.startswith(p) for p in self.PUBLIC_PREFIXES):
             return await call_next(request)
 
         # CORS 预检 (OPTIONS) 不携带自定义请求头 (含 X-API-Key),
