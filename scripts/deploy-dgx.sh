@@ -7,7 +7,7 @@
 #   bash deploy-dgx.sh
 #
 # 数据目录 (MD DOC vector_db DocScan dedup_results) 与运行时设置
-# (runtime_settings.json .env) 一律保留, 只替换代码/配置/前端产物。
+# (runtime_settings.json .env) 及 venv (backend/.venv) 一律保留, 只替换代码/配置/前端产物。
 # =============================================================================
 set -uo pipefail
 
@@ -57,6 +57,10 @@ for f in runtime_settings.json backend/.env; do
     cp -a "$OLD/$f" "$NEW/$f" && echo "  - 保留设置: $f"
   fi
 done
+# 保留 venv (旧实例已 setup 过则复用, 避免重跑 setup.sh; 新代码若改了依赖, 启动失败后手动: backend/.venv/bin/pip install -e backend)
+if [ -d "$OLD/backend/.venv" ]; then
+  cp -a "$OLD/backend/.venv" "$NEW/backend/.venv" && echo "  - 保留 venv: backend/.venv"
+fi
 
 # 4. 停旧服务 (若在跑)
 if [ -f "$OLD/start.sh" ]; then
