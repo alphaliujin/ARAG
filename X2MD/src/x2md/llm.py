@@ -292,10 +292,12 @@ def llm_batch_strip_noise(
                 except ValueError:
                     continue
                 verdict = parts[1].strip().upper()
-                if verdict.startswith("YES") and local_idx in local_index_map:
-                    results.append((local_index_map[local_idx], 1))
-                else:
-                    results.append((local_index_map[local_idx], 0))
+                # 模型幻觉的越界编号 (如 10 条 batch 里回 "99: NO"): 跳过该行,
+                # 不要因单个坏行 KeyError 被外层 except 吞掉, 否则整个 batch 的
+                # 判定结果全部丢弃 (含已解析的合法 YES), 噪声行会静默保留。
+                if local_idx not in local_index_map:
+                    continue
+                results.append((local_index_map[local_idx], 1 if verdict.startswith("YES") else 0))
         except Exception:
             pass
 

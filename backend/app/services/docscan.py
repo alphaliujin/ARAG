@@ -40,6 +40,9 @@ from app.services.chinese_norm import normalize_for_ngram
 VECTOR_BEGIN = "/ARAG-begin/"
 VECTOR_END = "/ARAG-end/"
 
+# 可上传/预处理的源文档扩展名 (与 endpoints 白名单一致, 用于识别"源文件" vs 派生产物)
+SOURCE_FILE_EXTENSIONS = (".pdf", ".docx", ".xlsx", ".pptx", ".txt", ".html", ".md")
+
 # bge-m3 不相关文本基线 (全项目统一)
 BGE_M3_BASELINE = 0.37
 
@@ -1347,7 +1350,7 @@ class DocScanService:
         docscan_dir = Path(settings.DOCSCAN_DIR)
         stem = Path(filename).stem
         source_file = None
-        for ext in ['.pdf', '.docx', '.xlsx', '.pptx', '.txt', '.html', '.md']:
+        for ext in SOURCE_FILE_EXTENSIONS:
             candidate = docscan_dir / f"{stem}{ext}"
             if candidate.exists():
                 source_file = candidate
@@ -1454,11 +1457,21 @@ class DocScanService:
             for f in files
             if f.name.endswith(".parents.json")
         }
+        # 源文件 stem 集合 (排除派生产物: .md/.parents.json/.children.json 均非源文件)。
+        # ★ 孤儿切片 (源文件已被删除, 如 delete_docscan_file 只删源文件的历史遗留)
+        # 不计入任何统计, 与 get_file_status 的"要求源文件存在"口径保持一致。
+        source_stems = {
+            f.name[:-len(f.suffix)]
+            for f in files
+            if f.suffix.lower() in SOURCE_FILE_EXTENSIONS
+        }
 
         preprocessed = 0
         embedded = 0
         compared = 0
         for stem in parents_stems:
+            if stem not in source_stems:
+                continue  # 孤儿切片: 源文件已删, 跳过
             preprocessed += 1
             # embedded/compared 需读 parents.json[0]["vector"] 标记
             parents_file = docscan_dir / f"{stem}.parents.json"

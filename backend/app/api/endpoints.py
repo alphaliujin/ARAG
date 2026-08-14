@@ -301,20 +301,27 @@ async def delete_docscan_file(name: str = Query(..., description="文件名 (仅
 
         logger.info(f"[AUDIT] Delete operation: docscan file '{name}' deleted")
         os.unlink(target)
-        # 同步清理 X2MD 输出的 <stem>.md/ 目录(含 parents/children JSON 与嵌入),
-        # 否则重传同名文件时会复用过期嵌入,产生 stale 比对结果。
-        # 注意: stem 必须基于已通过路径校验的 name,且只在 docscan_dir 下 rmtree。
+        # 同步清理 X2MD 派生的切片产物, 否则重传同名文件时会复用过期嵌入产生 stale
+        # 比对结果, 且 get_docscan_stats 会误报已删文档仍已处理。
+        # 三者均在 docscan_dir 根: <stem>.md (文件, docscan.py 的 output_path)、
+        # <stem>.parents.json、<stem>.children.json; 兼容旧布局的 <stem>.md/ 目录。
         import shutil
         stem = Path(name).stem
-        chunk_dir = (docscan_dir / f"{stem}.md").resolve()
-        try:
-            chunk_dir.relative_to(docscan_dir)
-            if chunk_dir.is_dir():
-                shutil.rmtree(chunk_dir, ignore_errors=True)
-                logger.info(f"[AUDIT] Also removed orphan chunk dir: {chunk_dir.name}")
-        except ValueError:
-            # stem 解析后落在 docscan_dir 之外(理论不会发生,name 已校验过),静默跳过
-            pass
+        for derived_name in (f"{stem}.md", f"{stem}.parents.json", f"{stem}.children.json"):
+            p = (docscan_dir / derived_name).resolve()
+            try:
+                p.relative_to(docscan_dir)  # 防穿越: 必须在 docscan_dir 内
+            except ValueError:
+                continue
+            try:
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                    logger.info(f"[AUDIT] Also removed orphan chunk dir: {p.name}")
+                elif p.is_file():
+                    p.unlink()
+                    logger.info(f"[AUDIT] Also removed derived file: {p.name}")
+            except OSError as e:
+                logger.warning(f"[AUDIT] Failed to clean derived file {p.name}: {e}")
         return {"status": "success", "message": f"已删除: {name}"}
 
     try:
