@@ -310,21 +310,27 @@ const ScanPage = () => {
 
   // ============ 文本扫描 ============
 
+  // 文本扫描请求序号: 连续快速扫描时, 过期 (慢) 响应不得覆盖新结果/重置 loading
+  const textScanSeqRef = useRef(0);
+
   const handleTextScan = async () => {
     if (!textValue || textValue.trim().length < 10) {
       message.warning('请输入至少 10 个字符的文本内容');
       return;
     }
+    const seq = ++textScanSeqRef.current;
     setTextScanning(true);
     try {
       const result = await scanText(textValue);
+      if (seq !== textScanSeqRef.current) return; // 已过期, 丢弃
       setTextResult(result);
       message.success('文本扫描完成');
     } catch (error) {
+      if (seq !== textScanSeqRef.current) return; // 已过期, 丢弃
       const detail = error.response?.data?.detail || error.message;
       message.error(`文本扫描失败: ${detail}`);
     } finally {
-      setTextScanning(false);
+      if (seq === textScanSeqRef.current) setTextScanning(false);
     }
   };
 

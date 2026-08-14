@@ -391,6 +391,12 @@ async def get_docscan_stats():
 @router.post("/ingest")
 async def ingest_documents(request: Optional[IngestRequest] = None):
     try:
+        # 与任务版 /tasks/ingest 互斥: 任务模式在跑时不并发执行同步版,
+        # 否则两线程同时写同一 ChromaDB/MD 目录互相覆盖
+        existing = task_manager.get_task_by_type("ingest")
+        if existing:
+            return {"status": "busy", "task_id": existing.task_id,
+                    "message": "已有入库任务在运行, 请等待完成后再试"}
         if request and request.classification_level:
             if request.classification_level not in VALID_CLASSIFICATIONS:
                 raise HTTPException(status_code=400, detail="Invalid classification level")
@@ -504,6 +510,11 @@ async def reset_database():
 async def preprocess_documents(request: PreprocessRequest):
     """预处理指定密级的文档（使用 X2MD 转换为 Markdown）"""
     try:
+        # 与任务版 /tasks/preprocess 互斥, 防同类型并发转换同一 MD 目录
+        existing = task_manager.get_task_by_type("preprocess")
+        if existing:
+            return {"status": "busy", "task_id": existing.task_id,
+                    "message": "已有预处理任务在运行, 请等待完成后再试"}
         if request.level not in DOC_LEVEL_MAP:
             raise HTTPException(status_code=400, detail=f"Invalid level: {request.level}")
 
@@ -591,6 +602,11 @@ async def run_deduplication():
     三档划分：≥0.8 高度相似 / 0.65-0.8 中度相似 / 0.5-0.65 弱相关
     """
     try:
+        # 与任务版 /tasks/dedup 互斥, 防同类型全量比对并发
+        existing = task_manager.get_task_by_type("dedup")
+        if existing:
+            return {"status": "busy", "task_id": existing.task_id,
+                    "message": "已有去重任务在运行, 请等待完成后再试"}
         dedup_service = _get_dedup_service()
         result = await asyncio.to_thread(
             dedup_service.run_deduplication,
