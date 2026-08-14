@@ -204,7 +204,9 @@ class DataIngestionService:
         """从切片文件聚合文档身份 (source) 集合, 用于入库去重预检."""
         sources: set = set()
         for f in files:
-            src = self._read_source(f)
+            # 修正: 此前误调不存在的 self._read_source -> AttributeError 被外层
+            # except 吞掉, 去重预检恒失败退化为全量重嵌, "全部已入库则跳过"永不触发
+            src = self._source_from_path(f)
             if src:
                 sources.add(src)
         return sources

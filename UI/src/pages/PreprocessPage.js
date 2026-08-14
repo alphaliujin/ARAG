@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useRef } from 'react';
-import axios from 'axios';
 import {
   Button,
   message,
@@ -31,7 +30,7 @@ import {
   RedoOutlined,
 } from '@ant-design/icons';
 import { startPreprocessTask, pollTaskUntilDone, resumeOrStartPolling, cancelTask } from '../utils/taskApi';
-import { API_BASE_URL, apiHeaders } from '../utils/api';
+import { API_BASE_URL, apiHeaders, apiClient } from '../utils/api';
 
 
 const { Option } = Select;
@@ -599,7 +598,9 @@ const PreprocessPage = () => {
     setIsRetrying(true);
     setRetryProgress(0);
     try {
-      const res = await axios.post(`${API_BASE_URL}/preprocess/retry`, {
+      // 走 apiClient (带 X-API-Key 拦截器): 此前裸 axios.post 绕过拦截器,
+      // 启用认证后失败重试必 401 (api.js 注释已警告过同类裸调用)。
+      const res = await apiClient.post('/preprocess/retry', {
         files: failedFiles.map(f => ({ level: f.level, file: f.file })),
         chunk_strategy: chunkStrategy,
         enable_llm: enableLLM,

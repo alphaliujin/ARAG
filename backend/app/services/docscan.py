@@ -1445,7 +1445,7 @@ class DocScanService:
                  if f.is_file() and not f.name.startswith('.')]
 
         # 辅助切片 JSON 不计入 total_files (非文档), 也不作为文档计数
-        AUX_SUFFIXES = (".parents.json", ".children.json")
+        AUX_SUFFIXES = (".parents.json", ".children.json", ".chunks.json")
         doc_files = [f for f in files if not f.name.endswith(AUX_SUFFIXES)]
 
         # 一次 iterdir 收集所有 .parents.json 的 stem (每个 = 一个已预处理文档)。
@@ -1457,14 +1457,28 @@ class DocScanService:
             for f in files
             if f.name.endswith(".parents.json")
         }
-        # 源文件 stem 集合 (排除派生产物: .md/.parents.json/.children.json 均非源文件)。
-        # ★ 孤儿切片 (源文件已被删除, 如 delete_docscan_file 只删源文件的历史遗留)
-        # 不计入任何统计, 与 get_file_status 的"要求源文件存在"口径保持一致。
-        source_stems = {
+        # 源文件 stem 集合 (排除派生产物):
+        # - .parents/.children/.chunks.json 恒为派生 (不进此集合)
+        # - <stem>.md 若与某非 .md 源文件同 stem (如 report.pdf 转换出的 report.md),
+        #   是 X2MD 派生物, 不算源文件; 仅当无同 stem 非 .md 源文件时 (直接上传的
+        #   .md) 才是源文档。这样 delete 历史遗留的 "report.md + report.parents.json"
+        #   孤儿不会被误计为 preprocessed, 与 get_file_status 口径一致。
+        non_md_source_stems = {
             f.name[:-len(f.suffix)]
             for f in files
-            if f.suffix.lower() in SOURCE_FILE_EXTENSIONS
+            if f.suffix.lower() in SOURCE_FILE_EXTENSIONS and f.suffix.lower() != ".md"
         }
+        source_stems = set(non_md_source_stems)
+        source_stems.update(
+            f.name[:-len(f.suffix)]
+            for f in files
+            if f.suffix.lower() == ".md" and f.name[:-len(f.suffix)] not in non_md_source_stems
+        )
+        # 派生 .md (与源文件同 stem) 也不计入 total_files, 避免单文档显示成 2 个
+        doc_files = [
+            f for f in doc_files
+            if not (f.suffix.lower() == ".md" and f.name[:-len(f.suffix)] in non_md_source_stems)
+        ]
 
         preprocessed = 0
         embedded = 0

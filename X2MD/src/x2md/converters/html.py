@@ -29,7 +29,9 @@ from x2md.utils import (
 # --------------------------------------------------------------------------
 
 _ALLOWED_HREF_SCHEMES = ("http", "https", "mailto", "ftp")
-_SCHEME_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*):")
+# 前导空白/控制字符 (如 "\njavascript:", "\x01javascript:") 必须先剥掉再判 scheme,
+# 否则 ^ 锚点在控制字符处落空, 被误当作"无 scheme 的相对路径"放行 (XSS 绕过)。
+_SCHEME_RE = re.compile(r"^[\s\x00-\x1f\x7f]*([a-zA-Z][a-zA-Z0-9+.-]*):")
 
 
 def _is_safe_href(href: str) -> bool:
@@ -225,8 +227,12 @@ class HtmlConverter(BaseConverter):
             saved_name = self._save_image(src)
             if saved_name:
                 parts.append(image_marker(saved_name))
-            else:
+            elif src and _is_safe_href(src):
+                # 远程图片抓取失败 (SSRF 拒抓/超时等) 时回退写原 URL;
+                # 但必须过 scheme 白名单, 否则 javascript:/data: 等会原样进 Markdown
                 parts.append(f"![{alt}]({src})")
+            elif alt:
+                parts.append(alt)
             return
 
         if tag_name == "br":

@@ -958,7 +958,10 @@ class Indexer:
                     image_collection_key = f"{rec.classification}_images"
                     try:
                         coll = self.store.get_or_create_collection(image_collection_key)
-                        coll.add(
+                        # upsert 而非 add: 图片无 manifest 追踪, 增量重跑会再次遇到
+                        # 同一 image_id (md5(分类:源md:索引:文件名)), add 必撞
+                        # DuplicateIDError; upsert 让内容变更的图片覆盖旧向量。
+                        coll.upsert(
                             documents=[rec.embedding_text],
                             embeddings=[rec.embedding],
                             metadatas=[meta],
@@ -1075,7 +1078,14 @@ class Indexer:
             except Exception as e:
                 logger.error(f"[CLEAR] Failed to init ChromaDB client: {e}")
                 return
-            for name in [retriever.parent_collection, retriever.child_collection]:
+            # 连同 <cls>_images 图片集合一起清 (此前漏删, 与全量 clear() 行为不一致,
+            # 导致清库后图片旧向量残留, 重跑 upsert 也不更新内容已变的图)
+            collections_to_delete = [
+                retriever.parent_collection,
+                retriever.child_collection,
+                f"{classification}_images",
+            ]
+            for name in collections_to_delete:
                 try:
                     client.delete_collection(name=name)
                     logger.info(f"[CLEAR] Deleted collection: {name}")
