@@ -682,16 +682,24 @@ class Indexer:
 
         for file_path, records in batch_records:
             try:
-                p, c = self._ingest_file_chunks(
+                p, c, dropped = self._ingest_file_chunks(
                     classification, file_path, records, retriever, regenerate_abstract
                 )
                 parents_total += p
                 children_total += c
-                # 成功 (embed+upsert 全过) 才记 manifest -> 下次跳过; 异常不记 -> 重试
-                try:
-                    self._manifest.mark_done(str(file_path), IndexManifest.file_hash(file_path), classification)
-                except Exception as me:
-                    logger.warning(f"[MANIFEST] mark_done failed for {file_path}: {me}")
+                # 成功 (embed+upsert 全过) 才记 manifest -> 下次跳过; 异常不记 -> 重试。
+                # ★ 有 sub-batch 嵌入失败/空向量被跳过时 (dropped>0), 不 mark_done,
+                #   否则下次重跑 is_done 命中会跳过该文件, 丢失的 chunk 永久不在向量库。
+                if dropped == 0:
+                    try:
+                        self._manifest.mark_done(str(file_path), IndexManifest.file_hash(file_path), classification)
+                    except Exception as me:
+                        logger.warning(f"[MANIFEST] mark_done failed for {file_path}: {me}")
+                else:
+                    logger.warning(
+                        f"[INDEX] {Path(file_path).name}: {dropped} chunk(s) dropped during embed/upsert, "
+                        f"manifest NOT marked done (will retry on next run)"
+                    )
             except Exception as e:
                 logger.error(f"[INDEX] Failed processing file {file_path}: {e}", exc_info=True)
             finally:
@@ -707,8 +715,12 @@ class Indexer:
         records: List[ChunkRecord],
         retriever: ParentChildRetriever,
         regenerate_abstract: bool,
-    ) -> Tuple[int, int]:
-        """单文件: 解析 → sub-batch 嵌入 → 入库 → 释放. 全程恒定内存."""
+    ) -> Tuple[int, int, int]:
+        """单文件: 解析 → sub-batch 嵌入 → 入库 → 释放. 全程恒定内存.
+
+        Returns: (parents_added, children_added, dropped) — dropped 为嵌入失败/
+        空向量/upsert 异常被跳过的 chunk 数, 调用方据此决定是否 mark_done。
+        """
         # 分类：parent / child / 普通 chunk
         parents = [r for r in records if r.is_parent]
         children = [r for r in records if r.is_child]
@@ -791,10 +803,13 @@ class Indexer:
         source_text = ""
 
         if not embed_items:
-            return 0, 0
+            return 0, 0, 0
 
         parents_total = 0
         children_total = 0
+        # 被丢弃的 chunk 数 (嵌入失败/空向量/upsert 异常): 调用方据此决定不 mark_done,
+        # 否则失败 chunk 会被 manifest 跳过, 永久丢失且重跑不补
+        dropped = 0
         total = len(embed_items)
 
         # ★ sub-batch 流式: 即使本文件有 5000 chunk, peak 也只是单 sub-batch
@@ -812,6 +827,7 @@ class Indexer:
                         f"got {len(embeddings) if embeddings else 0}"
                     )
                     # 已处理槽位置 None, 进入下一批
+                    dropped += embed_end - embed_start
                     for j in range(embed_start, embed_end):
                         embed_items[j] = None  # type: ignore
                     batch_texts = None
@@ -819,6 +835,7 @@ class Indexer:
             except Exception as e:
                 logger.error(f"[INDEX] Embed failed in {Path(file_path).name} "
                              f"[{embed_start}-{embed_end}]: {e}")
+                dropped += embed_end - embed_start
                 for j in range(embed_start, embed_end):
                     embed_items[j] = None  # type: ignore
                 batch_texts = None
@@ -835,6 +852,7 @@ class Indexer:
             for i, item in enumerate(batch_items):
                 emb = embeddings[i]
                 if not emb:
+                    dropped += 1  # 空向量静默跳过也会丢数据, 计入 dropped
                     continue
                 if item["type"] == "parent" or item["type"] == "chunk":
                     parent_chunks.append((item["embedding_text"], item["meta"]))
@@ -852,11 +870,13 @@ class Indexer:
                     retriever.add_parent_chunks(parent_chunks, embeddings=parent_embeddings, ids=parent_ids)
                 except Exception as e:
                     logger.error(f"[INDEX] add_parent_chunks failed: {e}")
+                    dropped += len(parent_chunks)
             if child_chunks:
                 try:
                     retriever.add_child_chunks(child_chunks, embeddings=child_embeddings, ids=child_ids)
                 except Exception as e:
                     logger.error(f"[INDEX] add_child_chunks failed: {e}")
+                    dropped += len(child_chunks)
 
             # 本 sub-batch 的所有引用归零, 加 del 帮 CPython 即时 refcount=0
             for j in range(embed_start, embed_end):
@@ -866,7 +886,7 @@ class Indexer:
 
         # 文件结束: embed_items 已全 None, 显式清掉 list 本身
         embed_items.clear()
-        return parents_total, children_total
+        return parents_total, children_total, dropped
 
     def _md_path_from_chunk_path(self, chunk_path: Path) -> Optional[Path]:
         """从 .parents.json / .children.json / .chunks.json 反推 MD 原文路径."""

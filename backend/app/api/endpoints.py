@@ -207,12 +207,18 @@ async def docscan_embed(filename: str = Query(..., description="文件名")):
     task_id = task_manager.create_task("docscan_embed", {"filename": filename})
 
     def _run():
-        info = task_manager.get_task(task_id)
-        cancel_evt = info.cancel_event if info else None
-        callback = task_manager.make_progress_callback(task_id)
-        return docscan_service.embed_file_vectors(
-            filename, progress_callback=callback, cancel_event=cancel_evt
-        )
+        # pin embedder: 任务全程持有引用计数, 并发 docscan_compare 结束后
+        # cleanup_memory 才不会把这个正在用的 embedder release 掉 (MPS 崩溃/脏向量)
+        docscan_service._pin_embedder()
+        try:
+            info = task_manager.get_task(task_id)
+            cancel_evt = info.cancel_event if info else None
+            callback = task_manager.make_progress_callback(task_id)
+            return docscan_service.embed_file_vectors(
+                filename, progress_callback=callback, cancel_event=cancel_evt
+            )
+        finally:
+            docscan_service._unpin_embedder()
 
     task_manager.run_in_thread(task_id, _run)
     return {"task_id": task_id, "status": "pending"}

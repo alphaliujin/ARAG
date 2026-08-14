@@ -26,6 +26,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -485,6 +486,11 @@ class DocScanService:
 
     def __init__(self):
         self._embedder = None
+        # embedder 引用计数: embed 任务期间 pin 住, cleanup_memory 只在无人使用时
+        # 才 release, 否则并发运行的 compare 结束后会把正在用的 embedder 释放掉
+        # (MPS 上已释放模型继续 embed 会崩溃 / 返回脏向量)。
+        self._embedder_pins = 0
+        self._embedder_lock = threading.Lock()
 
     def _validate_filename(self, filename: str) -> str:
         """Sanitize filename to prevent path traversal."""
@@ -504,27 +510,39 @@ class DocScanService:
 
     def _get_embedder(self):
         """获取或创建 embedder (与 DataIngestionService 相同配置)."""
-        if self._embedder is not None:
+        # 加锁: 并发 _get_embedder 时避免重复创建覆盖, 以及创建中途被 cleanup 释放
+        with self._embedder_lock:
+            if self._embedder is not None:
+                return self._embedder
+
+            from md2rag.embedder import create_embedder
+
+            if settings.EMBEDDING_MODEL == "ollama-bge-m3":
+                self._embedder = create_embedder(
+                    model_type="ollama",
+                    ollama_url=settings.OLLAMA_BASE_URL,
+                    ollama_model="bge-m3:latest",
+                    ollama_cache_path=os.path.join(settings.VECTOR_DB_DIR, "md2rag_embedding_cache.sqlite"),
+                )
+            elif settings.EMBEDDING_MODEL == "mps-bge-m3":
+                self._embedder = create_embedder(
+                    model_type="mps",
+                    device="mps",
+                )
+            else:
+                self._embedder = create_embedder(model_type="chromadb-default")
+
             return self._embedder
 
-        from md2rag.embedder import create_embedder
+    def _pin_embedder(self) -> None:
+        """占用计数 +1: 使用 embedder 前必须 pin, 防并发 cleanup_memory 释放."""
+        with self._embedder_lock:
+            self._embedder_pins += 1
 
-        if settings.EMBEDDING_MODEL == "ollama-bge-m3":
-            self._embedder = create_embedder(
-                model_type="ollama",
-                ollama_url=settings.OLLAMA_BASE_URL,
-                ollama_model="bge-m3:latest",
-                ollama_cache_path=os.path.join(settings.VECTOR_DB_DIR, "md2rag_embedding_cache.sqlite"),
-            )
-        elif settings.EMBEDDING_MODEL == "mps-bge-m3":
-            self._embedder = create_embedder(
-                model_type="mps",
-                device="mps",
-            )
-        else:
-            self._embedder = create_embedder(model_type="chromadb-default")
-
-        return self._embedder
+    def _unpin_embedder(self) -> None:
+        """占用计数 -1 (使用结束后 finally 里调用)."""
+        with self._embedder_lock:
+            self._embedder_pins = max(0, self._embedder_pins - 1)
 
     # ------------------------------------------------------------------
     # 步骤 1: 预处理 (X2MD 转换)
@@ -1410,13 +1428,18 @@ class DocScanService:
         三按钮流程结束 / 比对结束时必须一并卸载, 否则与 ingestion.embedder 共存
         时进程 RSS 显著翻倍。
         """
-        # 嵌入器内部如果有 LRU cache 也顺手清, 防止 Ollama 路径下漏掉
-        try:
-            if self._embedder is not None and hasattr(self._embedder, "release"):
-                self._embedder.release()
-        except Exception:
-            pass
-        self._embedder = None
+        # 嵌入器内部如果有 LRU cache 也顺手清, 防止 Ollama 路径下漏掉;
+        # 但仅在无 embed 任务占用 (pins==0) 时才 release+置 None,
+        # 否则并发运行的 docscan_embed 后台任务会用上已释放的模型而崩溃
+        # (MPS 路径尤其; 旧实现 compare 结束 cleanup 即释放共享 embedder)。
+        with self._embedder_lock:
+            if self._embedder_pins == 0 and self._embedder is not None:
+                try:
+                    if hasattr(self._embedder, "release"):
+                        self._embedder.release()
+                except Exception:
+                    pass
+                self._embedder = None
         try:
             reranker.release()
         except Exception:
