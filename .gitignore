@@ -78,6 +78,7 @@ runtime_settings.json
 .env
 .env.*
 !.env.example
+!.env.production
 
 # ---- 编辑器 / 操作系统 ----
 .DS_Store

@@ -1,10 +1,14 @@
 import axios from 'axios';
 
 // 全局 API 基础 URL
-// 生产环境推荐使用相对路径 (例如 '/api/v1') + 反向代理,避免硬编码 host;
-// 开发期回落到 localhost:8000 仅是为了 npm start 时方便,
-// 部署到任何非 localhost 环境必须设置 REACT_APP_API_BASE_URL。
-export const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'http://localhost:8000/api/v1';
+// 默认相对路径 '/api/v1' (同源): 生产部署是单进程 uvicorn 同源服务 UI(/) + API(/api/v1),
+// 相对路径让浏览器把 API 调用发回"提供页面的那台服务器", 无论从哪个 IP 访问都正确。
+// 之前默认 'http://localhost:8000/api/v1' 会被原样打进构建产物, 部署到 DGX 后远程浏览器
+// 仍把 API 请求发到访问者本机的 localhost:8000 (而非 DGX), fetch 失败被前端静默吞成
+// "扫描到 0 个文件" —— 即"刷新找不到 DOC 文件"的根因。
+// 开发期 (npm start, 前端在 :3000) 靠 package.json 的 "proxy" 把 /api/v1 转发到 :8000 后端。
+// 如需覆盖默认, 设 REACT_APP_API_BASE_URL (写入 UI/.env.local 或构建环境)。
+export const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || '/api/v1';
 
 // 可选的 API Key - 后端 AUTH_DISABLED=False 时必填。
 // 通过 REACT_APP_API_KEY 注入(写到 UI/.env.local 或构建环境)。
