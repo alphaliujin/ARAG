@@ -86,12 +86,14 @@ def _signal_handler(signum, frame):
     sys.exit(128 + signum)
 
 
-# 注册信号处理器
-for _sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-    try:
-        signal.signal(_sig, _signal_handler)
-    except (OSError, ValueError):
-        pass  # Windows 上可能没有 SIGHUP
+# 注册信号处理器 (仅 standalone CLI 运行时; 被 web 服务 import 时不应劫持 uvicorn 进程信号,
+# 否则 SIGHUP(终端断开/nohup)/SIGTERM 会让服务进程 sys.exit 退出且无 supervisor 自愈)
+if __name__ == "__main__":
+    for _sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(_sig, _signal_handler)
+        except (OSError, ValueError):
+            pass  # Windows 上可能没有 SIGHUP
 
 
 # ------------------------------------------------------------------------
