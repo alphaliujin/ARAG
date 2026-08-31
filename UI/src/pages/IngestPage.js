@@ -309,7 +309,7 @@ const IngestPage = () => {
         if (clearing) return; // 防双击: 已在清空中则忽略 (后端 _reset_lock 为最终互斥保障)
         setClearing(true);
         try {
-          const res = await apiClient.delete(`/reset`);
+          const res = await apiClient.delete(`/reset`, { timeout: 300000 });  // 清空删 chromadb+VACUUM 实测~3min, 默认 30s 会超时
           const status = res?.data?.status;
           const detail = res?.data?.message || '';
           if (status === 'busy') {
