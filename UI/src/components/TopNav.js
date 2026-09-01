@@ -39,7 +39,7 @@ const TopNav = ({ activeMenu, onMenuChange }) => {
       </div>
 
       <div className="nav-toolbar">
-        <span style={{ color: 'rgba(255,255,255,0.5)', fontSize: '12px' }}>v0.2.0</span>
+        <span style={{ color: 'rgba(255,255,255,0.5)', fontSize: '12px' }}>v0.2.7</span>
       </div>
     </nav>
   );
