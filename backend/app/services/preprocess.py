@@ -7,6 +7,13 @@ from typing import Callable, Dict, List, Optional
 from app.core.config import settings
 from md2rag.loader import CLASSIFICATION_DIR_MAP
 
+# 支持的源文件扩展名。图片扩展名与 X2MD ImageConverter.extensions 保持一致:
+# 独立图片文件经 ImageConverter 走 OCR (tesseract/paddle) 转为文本入库。
+# .xls/.ppt 由 X2MD legacy_office.py 经 LibreOffice 转换 (DGX 已装 libreoffice)。
+SUPPORTED_EXTS = ['.pdf', '.docx', '.doc', '.xlsx', '.xls', '.pptx', '.ppt',
+                  '.txt', '.html', '.md',
+                  '.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp']
+
 
 def _resolve_preprocess_defaults(
     enable_llm: Optional[bool],
@@ -95,13 +102,12 @@ class PreprocessService:
         # 创建输出目录
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # 扫描源文件
-        source_files = []
-        for ext in ['.pdf', '.docx', '.doc', '.xlsx', '.pptx', '.txt', '.html', '.md']:
-            source_files.extend(source_dir.rglob(f'*{ext}'))
-
-        # 过滤掉隐藏文件
-        source_files = [f for f in source_files if not f.name.startswith('.')]
+        # 扫描源文件 (大小写不敏感: rglob('*.png') 匹配不到 .PNG)
+        source_files = [
+            f for f in source_dir.rglob('*')
+            if f.is_file() and not f.name.startswith('.')
+            and f.suffix.lower() in SUPPORTED_EXTS
+        ]
         total_files = len(source_files)
 
         if progress_callback:
@@ -444,7 +450,7 @@ class PreprocessService:
             if candidate.exists():
                 source_file = candidate
             if not source_file:
-                for ext in ['.pdf', '.docx', '.doc', '.xlsx', '.pptx', '.txt', '.html', '.md']:
+                for ext in SUPPORTED_EXTS:
                     candidate = source_dir / f"{file_name}{ext}"
                     if candidate.exists():
                         source_file = candidate
@@ -452,7 +458,7 @@ class PreprocessService:
             if not source_file:
                 stem = Path(file_name).stem
                 for f in source_dir.rglob(f'{stem}.*'):
-                    if not f.name.startswith('.') and f.suffix.lower() in ['.pdf', '.docx', '.doc', '.xlsx', '.pptx', '.txt', '.html', '.md']:
+                    if not f.name.startswith('.') and f.suffix.lower() in SUPPORTED_EXTS:
                         source_file = f
                         break
 

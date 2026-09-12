@@ -33,6 +33,8 @@ v "UI/build"
 
 echo "[4/6] 运行时配置 + 部署脚本..."
 cp "$ROOT/runtime_settings.json" "$STAGE/runtime_settings.json"
+# ★ 生产启动/停止脚本【唯一真相】在 deploy/: 根目录的 start.sh/stop.sh 是 macOS
+#   开发双进程版, 与本打包无关。改动生产部署行为只改 deploy/, 此处始终从 deploy/ 拷。
 cp "$ROOT/deploy/setup.sh" "$STAGE/setup.sh"
 cp "$ROOT/deploy/start.sh" "$STAGE/start.sh"
 cp "$ROOT/deploy/stop.sh" "$STAGE/stop.sh"

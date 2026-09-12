@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import ipaddress
+import re
 import socket
 import urllib.parse
 import urllib.request as _ureq
@@ -18,6 +19,29 @@ from x2md.utils import (
     strip_toc_markers,
     table_to_lines,
 )
+
+
+# --------------------------------------------------------------------------
+# href 协议白名单: 阻止 javascript:/data:/vbscript: 等 XSS scheme 注入到
+# Markdown 输出, 同时放行文档站最常见的相对路径链接 (chapter2.html 等)。
+# 用"是否含 scheme"判断而非"是否以 http:// 开头", 故相对路径不被误杀;
+# scheme 大小写不敏感 (HTTPS:// 合法)。
+# --------------------------------------------------------------------------
+
+_ALLOWED_HREF_SCHEMES = ("http", "https", "mailto", "ftp")
+# 前导空白/控制字符 (如 "\njavascript:", "\x01javascript:") 必须先剥掉再判 scheme,
+# 否则 ^ 锚点在控制字符处落空, 被误当作"无 scheme 的相对路径"放行 (XSS 绕过)。
+_SCHEME_RE = re.compile(r"^[\s\x00-\x1f\x7f]*([a-zA-Z][a-zA-Z0-9+.-]*):")
+
+
+def _is_safe_href(href: str) -> bool:
+    """href 是否可安全写入 Markdown 链接 (True=可写, False=丢弃 href 仅留文本)."""
+    if not href:
+        return False
+    m = _SCHEME_RE.match(href)
+    if m is None:
+        return True  # 无 scheme = 相对路径, 不可能携带危险 scheme
+    return m.group(1).lower() in _ALLOWED_HREF_SCHEMES
 
 
 # --------------------------------------------------------------------------
@@ -187,9 +211,9 @@ class HtmlConverter(BaseConverter):
             href = element.get("href", "")
             text = element.get_text(strip=True)
             if text and href:
-                # 协议白名单: 阻止 javascript:/data:/vbscript: 等 XSS 注入到 Markdown 输出。
-                # 不安全协议丢弃 href, 仅保留链接文本。
-                if href.startswith(("http://", "https://", "mailto:", "#", "ftp://")):
+                # 协议白名单: 阻止 javascript:/data: 等 XSS 注入到 Markdown 输出;
+                # 相对路径 (无 scheme) 放行。不安全协议丢弃 href, 仅保留链接文本。
+                if _is_safe_href(href):
                     parts.append(f"[{text}]({href})")
                 else:
                     parts.append(text)
@@ -203,8 +227,12 @@ class HtmlConverter(BaseConverter):
             saved_name = self._save_image(src)
             if saved_name:
                 parts.append(image_marker(saved_name))
-            else:
+            elif src and _is_safe_href(src):
+                # 远程图片抓取失败 (SSRF 拒抓/超时等) 时回退写原 URL;
+                # 但必须过 scheme 白名单, 否则 javascript:/data: 等会原样进 Markdown
                 parts.append(f"![{alt}]({src})")
+            elif alt:
+                parts.append(alt)
             return
 
         if tag_name == "br":
@@ -264,8 +292,9 @@ class HtmlConverter(BaseConverter):
             href = element.get("href", "")
             text = "".join(self._inline_walk(c) for c in element.children).strip()
             if text and href:
-                # 协议白名单: 与 _walk 中 <a> 处理一致, 阻止 javascript:/data: 等
-                if href.startswith(("http://", "https://", "mailto:", "#", "ftp://")):
+                # 协议白名单: 与 _walk 中 <a> 处理一致, 阻止 javascript:/data: 等;
+                # 相对路径 (无 scheme) 放行。
+                if _is_safe_href(href):
                     return f"[{text}]({href})"
                 return text  # 不安全协议仅保留链接文本
             return text

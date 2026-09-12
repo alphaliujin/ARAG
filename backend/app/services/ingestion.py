@@ -65,6 +65,10 @@ class DataIngestionService:
         # 防 reset 并发 (双击 / 清空+切换模型 同时触发): 非阻塞获取,
         # 抢不到说明已有 reset 在跑, 直接返回 status="busy" 而非报错/partial。
         self._reset_lock = threading.Lock()
+        # 入库执行锁 (RLock 因 ingest_all_levels 会可重入调用 ingest_directory):
+        # ingest 期间持有, reset_all/switch_embedding_model 抢不到就返回 busy,
+        # 防止清空 collection / 释放 embedder 时入库线程还在写 (崩溃/部分清空)。
+        self._ingest_lock = threading.RLock()
 
     def _get_indexer(self):
         """延迟初始化 MD2RAG Indexer (原 V2 分批版本, 已合并为唯一实现)."""
@@ -204,7 +208,9 @@ class DataIngestionService:
         """从切片文件聚合文档身份 (source) 集合, 用于入库去重预检."""
         sources: set = set()
         for f in files:
-            src = self._read_source(f)
+            # 修正: 此前误调不存在的 self._read_source -> AttributeError 被外层
+            # except 吞掉, 去重预检恒失败退化为全量重嵌, "全部已入库则跳过"永不触发
+            src = self._source_from_path(f)
             if src:
                 sources.add(src)
         return sources
@@ -267,6 +273,9 @@ class DataIngestionService:
         Returns:
             Dict: 入库结果. 全部已入库时 status='skipped', 此时不调 MD2RAG.
         """
+        # 持锁执行: reset_all/switch_embedding_model 非阻塞抢这把锁, 抢不到即拒绝
+        # 清库/切模型, 避免与入库写入并发 (清空中的 collection + 已释放 embedder)
+        self._ingest_lock.acquire()
         try:
             # 去重预检 (P2-3): 已入库文档不再 embed
             if not force:
@@ -389,10 +398,13 @@ class DataIngestionService:
                 "images_added": 0,
             }
         finally:
-            # 入库结束，释放 Indexer 及底层模型/Chroma 引用，降低常驻内存
-            # 仅在独立调用时释放; 由 ingest_all_levels 调用时保留 indexer 以避免重复加载
-            if release_after:
-                self._cleanup_memory()
+            try:
+                # 入库结束，释放 Indexer 及底层模型/Chroma 引用，降低常驻内存
+                # 仅在独立调用时释放; 由 ingest_all_levels 调用时保留 indexer 以避免重复加载
+                if release_after:
+                    self._cleanup_memory()
+            finally:
+                self._ingest_lock.release()
 
     def ingest_all_levels(
         self,
@@ -584,47 +596,60 @@ class DataIngestionService:
         4) 物理清理: 删除 ChromaDB HNSW UUID 目录 + SQLite VACUUM
         5) 以清理后的最终计数判定 success/partial (中途 after 在并发/事务延迟下可能读到陈旧 >0)
         """
-        # 互斥: 非阻塞获取。并发 reset (双击 / 清空+切换模型 同时触发) 直接返回 busy,
-        # 不抛异常也不报 partial, 让前端按 status="busy" 友好提示, 避免假"失败"。
-        if not self._reset_lock.acquire(blocking=False):
+        # 互斥1: 入库执行中不得清库 (会删掉正在写的 collection + 释放 embedder,
+        # 入库线程崩溃/部分清空)。非阻塞获取, 抢不到说明 ingest 在跑, 返回 busy。
+        if not self._ingest_lock.acquire(blocking=False):
             return {
                 "status": "busy",
-                "message": "Reset already in progress, please wait",
+                "message": "入库任务正在运行, 请等待完成后清空",
                 "vectors_before": None,
                 "vectors_after": None,
             }
         try:
-            before = self.get_database_stats().get("total_vectors", -1)
-            indexer = self._get_indexer()
-            indexer.clear()
-            # 强制释放 indexer 持有的 client 引用, 否则 after 统计可能读到缓存
-            self._release_indexer()
-            after = self.get_database_stats().get("total_vectors", -1)
-            if after > 0:
-                # 兜底: indexer.clear 没清掉的剩余 collection 再扫一遍
-                self._force_purge_remaining()
+            # 互斥2: 并发 reset (双击 / 清空+切换模型 同时触发) 直接返回 busy,
+            # 不抛异常也不报 partial, 让前端按 status="busy" 友好提示, 避免假"失败"。
+            # (抢不到时直接 return, 由外层 finally 释放 _ingest_lock)
+            if not self._reset_lock.acquire(blocking=False):
+                return {
+                    "status": "busy",
+                    "message": "Reset already in progress, please wait",
+                    "vectors_before": None,
+                    "vectors_after": None,
+                }
+            try:
+                before = self.get_database_stats().get("total_vectors", -1)
+                indexer = self._get_indexer()
+                indexer.clear()
+                # 强制释放 indexer 持有的 client 引用, 否则 after 统计可能读到缓存
+                self._release_indexer()
                 after = self.get_database_stats().get("total_vectors", -1)
+                if after > 0:
+                    # 兜底: indexer.clear 没清掉的剩余 collection 再扫一遍
+                    self._force_purge_remaining()
+                    after = self.get_database_stats().get("total_vectors", -1)
 
-            # 物理清理: ChromaDB 的 delete_collection 只删 SQLite 记录,
-            # 不删 HNSW 向量索引目录(UUID 子目录),也不回收 SQLite 空间。
-            # 这些残留不影响功能但浪费磁盘, 在 reset 时一并清除。
-            self._physical_cleanup()
+                # 物理清理: ChromaDB 的 delete_collection 只删 SQLite 记录,
+                # 不删 HNSW 向量索引目录(UUID 子目录),也不回收 SQLite 空间。
+                # 这些残留不影响功能但浪费磁盘, 在 reset 时一并清除。
+                self._physical_cleanup()
 
-            # 以物理清理完成后的最终计数为准: 此前的 after 在并发/事务提交延迟下
-            # 可能读到陈旧 >0 (历史假"partial"的根因)。clear()+purge+cleanup 已尽力清空,
-            # 这重查一次拿到确定结果。
-            final = self.get_database_stats().get("total_vectors", -1)
+                # 以物理清理完成后的最终计数为准: 此前的 after 在并发/事务提交延迟下
+                # 可能读到陈旧 >0 (历史假"partial"的根因)。clear()+purge+cleanup 已尽力清空,
+                # 这重查一次拿到确定结果。
+                final = self.get_database_stats().get("total_vectors", -1)
 
-            return {
-                "status": "success" if final == 0 else "partial",
-                "message": f"Reset: {before} -> {final} vectors",
-                "vectors_before": before,
-                "vectors_after": final,
-            }
+                return {
+                    "status": "success" if final == 0 else "partial",
+                    "message": f"Reset: {before} -> {final} vectors",
+                    "vectors_before": before,
+                    "vectors_after": final,
+                }
+            finally:
+                self._reset_lock.release()
         except Exception as e:
             return {"status": "error", "message": str(e)}
         finally:
-            self._reset_lock.release()
+            self._ingest_lock.release()
 
     def _force_purge_remaining(self) -> None:
         """兜底: 用裸 ChromaDB client 枚举并删除所有残留 collection."""

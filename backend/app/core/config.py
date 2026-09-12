@@ -4,7 +4,7 @@ import os
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "敏感信息识别系统"
-    VERSION: str = "0.2.0"
+    VERSION: str = "0.2.7"
     API_PREFIX: str = "/api/v1"
 
     BACKEND_HOST: str = "127.0.0.1"  # 默认仅本机访问; 需对外暴露时可改为 0.0.0.0

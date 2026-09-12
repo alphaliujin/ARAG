@@ -26,6 +26,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,6 +40,9 @@ from app.services.chinese_norm import normalize_for_ngram
 # 向量标记常量
 VECTOR_BEGIN = "/ARAG-begin/"
 VECTOR_END = "/ARAG-end/"
+
+# 可上传/预处理的源文档扩展名 (与 endpoints 白名单一致, 用于识别"源文件" vs 派生产物)
+SOURCE_FILE_EXTENSIONS = (".pdf", ".docx", ".xlsx", ".pptx", ".txt", ".html", ".md")
 
 # bge-m3 不相关文本基线 (全项目统一)
 BGE_M3_BASELINE = 0.37
@@ -482,6 +486,11 @@ class DocScanService:
 
     def __init__(self):
         self._embedder = None
+        # embedder 引用计数: embed 任务期间 pin 住, cleanup_memory 只在无人使用时
+        # 才 release, 否则并发运行的 compare 结束后会把正在用的 embedder 释放掉
+        # (MPS 上已释放模型继续 embed 会崩溃 / 返回脏向量)。
+        self._embedder_pins = 0
+        self._embedder_lock = threading.Lock()
 
     def _validate_filename(self, filename: str) -> str:
         """Sanitize filename to prevent path traversal."""
@@ -501,27 +510,39 @@ class DocScanService:
 
     def _get_embedder(self):
         """获取或创建 embedder (与 DataIngestionService 相同配置)."""
-        if self._embedder is not None:
+        # 加锁: 并发 _get_embedder 时避免重复创建覆盖, 以及创建中途被 cleanup 释放
+        with self._embedder_lock:
+            if self._embedder is not None:
+                return self._embedder
+
+            from md2rag.embedder import create_embedder
+
+            if settings.EMBEDDING_MODEL == "ollama-bge-m3":
+                self._embedder = create_embedder(
+                    model_type="ollama",
+                    ollama_url=settings.OLLAMA_BASE_URL,
+                    ollama_model="bge-m3:latest",
+                    ollama_cache_path=os.path.join(settings.VECTOR_DB_DIR, "md2rag_embedding_cache.sqlite"),
+                )
+            elif settings.EMBEDDING_MODEL == "mps-bge-m3":
+                self._embedder = create_embedder(
+                    model_type="mps",
+                    device="mps",
+                )
+            else:
+                self._embedder = create_embedder(model_type="chromadb-default")
+
             return self._embedder
 
-        from md2rag.embedder import create_embedder
+    def _pin_embedder(self) -> None:
+        """占用计数 +1: 使用 embedder 前必须 pin, 防并发 cleanup_memory 释放."""
+        with self._embedder_lock:
+            self._embedder_pins += 1
 
-        if settings.EMBEDDING_MODEL == "ollama-bge-m3":
-            self._embedder = create_embedder(
-                model_type="ollama",
-                ollama_url=settings.OLLAMA_BASE_URL,
-                ollama_model="bge-m3:latest",
-                ollama_cache_path=os.path.join(settings.VECTOR_DB_DIR, "md2rag_embedding_cache.sqlite"),
-            )
-        elif settings.EMBEDDING_MODEL == "mps-bge-m3":
-            self._embedder = create_embedder(
-                model_type="mps",
-                device="mps",
-            )
-        else:
-            self._embedder = create_embedder(model_type="chromadb-default")
-
-        return self._embedder
+    def _unpin_embedder(self) -> None:
+        """占用计数 -1 (使用结束后 finally 里调用)."""
+        with self._embedder_lock:
+            self._embedder_pins = max(0, self._embedder_pins - 1)
 
     # ------------------------------------------------------------------
     # 步骤 1: 预处理 (X2MD 转换)
@@ -1347,7 +1368,7 @@ class DocScanService:
         docscan_dir = Path(settings.DOCSCAN_DIR)
         stem = Path(filename).stem
         source_file = None
-        for ext in ['.pdf', '.docx', '.xlsx', '.pptx', '.txt', '.html', '.md']:
+        for ext in SOURCE_FILE_EXTENSIONS:
             candidate = docscan_dir / f"{stem}{ext}"
             if candidate.exists():
                 source_file = candidate
@@ -1407,13 +1428,18 @@ class DocScanService:
         三按钮流程结束 / 比对结束时必须一并卸载, 否则与 ingestion.embedder 共存
         时进程 RSS 显著翻倍。
         """
-        # 嵌入器内部如果有 LRU cache 也顺手清, 防止 Ollama 路径下漏掉
-        try:
-            if self._embedder is not None and hasattr(self._embedder, "release"):
-                self._embedder.release()
-        except Exception:
-            pass
-        self._embedder = None
+        # 嵌入器内部如果有 LRU cache 也顺手清, 防止 Ollama 路径下漏掉;
+        # 但仅在无 embed 任务占用 (pins==0) 时才 release+置 None,
+        # 否则并发运行的 docscan_embed 后台任务会用上已释放的模型而崩溃
+        # (MPS 路径尤其; 旧实现 compare 结束 cleanup 即释放共享 embedder)。
+        with self._embedder_lock:
+            if self._embedder_pins == 0 and self._embedder is not None:
+                try:
+                    if hasattr(self._embedder, "release"):
+                        self._embedder.release()
+                except Exception:
+                    pass
+                self._embedder = None
         try:
             reranker.release()
         except Exception:
@@ -1441,24 +1467,50 @@ class DocScanService:
         files = [f for f in docscan_dir.iterdir()
                  if f.is_file() and not f.name.startswith('.')]
 
-        # 一次 iterdir 收集所有 .parents.json 的 stem, 避免逐文件调 get_file_status
-        # 各自再 iterdir 搜源文件 (O(N²) 目录扫描)。stats 遍历的是真实源文件,
-        # f.stem 即 actual_stem, 直接用集合 membership 判定是否已预处理。
+        # 辅助切片 JSON 不计入 total_files (非文档), 也不作为文档计数
+        AUX_SUFFIXES = (".parents.json", ".children.json", ".chunks.json")
+        doc_files = [f for f in files if not f.name.endswith(AUX_SUFFIXES)]
+
+        # 一次 iterdir 收集所有 .parents.json 的 stem (每个 = 一个已预处理文档)。
+        # 避免逐文件调 get_file_status 各自 iterdir 搜源文件 (O(N²) 目录扫描)。
+        # ★ 按 stem 去重遍历: report.pdf 与 report.md 同 stem, 只算一个文档
+        # (旧实现遍历 files, 两者都命中 parents_stems, preprocessed/embedded/compared 翻倍)。
         parents_stems = {
             f.name[:-len(".parents.json")]
             for f in files
             if f.name.endswith(".parents.json")
         }
+        # 源文件 stem 集合 (排除派生产物):
+        # - .parents/.children/.chunks.json 恒为派生 (不进此集合)
+        # - <stem>.md 若与某非 .md 源文件同 stem (如 report.pdf 转换出的 report.md),
+        #   是 X2MD 派生物, 不算源文件; 仅当无同 stem 非 .md 源文件时 (直接上传的
+        #   .md) 才是源文档。这样 delete 历史遗留的 "report.md + report.parents.json"
+        #   孤儿不会被误计为 preprocessed, 与 get_file_status 口径一致。
+        non_md_source_stems = {
+            f.name[:-len(f.suffix)]
+            for f in files
+            if f.suffix.lower() in SOURCE_FILE_EXTENSIONS and f.suffix.lower() != ".md"
+        }
+        source_stems = set(non_md_source_stems)
+        source_stems.update(
+            f.name[:-len(f.suffix)]
+            for f in files
+            if f.suffix.lower() == ".md" and f.name[:-len(f.suffix)] not in non_md_source_stems
+        )
+        # 派生 .md (与源文件同 stem) 也不计入 total_files, 避免单文档显示成 2 个
+        doc_files = [
+            f for f in doc_files
+            if not (f.suffix.lower() == ".md" and f.name[:-len(f.suffix)] in non_md_source_stems)
+        ]
 
         preprocessed = 0
         embedded = 0
         compared = 0
-        for f in files:
-            stem = f.stem
-            if stem not in parents_stems:
-                continue
+        for stem in parents_stems:
+            if stem not in source_stems:
+                continue  # 孤儿切片: 源文件已删, 跳过
             preprocessed += 1
-            # embedded/compared 需读 parents.json[0]["vector"] 标记 (仅对已预处理文件)
+            # embedded/compared 需读 parents.json[0]["vector"] 标记
             parents_file = docscan_dir / f"{stem}.parents.json"
             try:
                 p_data = json.loads(parents_file.read_text(encoding="utf-8"))
@@ -1474,7 +1526,7 @@ class DocScanService:
                 pass
 
         return {
-            "total_files": len(files),
+            "total_files": len(doc_files),
             "preprocessed": preprocessed,
             "embedded": embedded,
             "compared": compared,

@@ -62,7 +62,15 @@ def _validate_ollama_url(url: Any) -> str:
 
     嵌入/LLM 调用时文档原文会 POST 到该 URL, 必须限制为 http/https 且拒绝云元数据
     等危险端点。允许 loopback / RFC1918 内网 (Ollama 常部署于本地或局域网)。
+
+    除字面主机名黑名单外, 再把 host 经 getaddrinfo 解析成实际 IP 逐条校验,
+    拦截编码形式的绕过 (IPv6-mapped / 十六进制 / 十进制整数 / 短别名):
+    这些表示经系统解析后归一到同一 IP, 只要任一解析结果落在 link-local
+    (169.254.0.0/16、fe80::/10, 云元数据端点所在段) 即拒绝。解析失败
+    (如仅 /etc/hosts 或 mDNS 可解析的局域网别名) 不误拒 — 请求侧同样不可达。
     """
+    import ipaddress
+    import socket
     from urllib.parse import urlparse
 
     raw = str(url)
@@ -78,12 +86,30 @@ def _validate_ollama_url(url: Any) -> str:
     host = (parsed.hostname or "").lower()
     if not host:
         raise ValueError(f"ollamaUrl must have a host: {raw!r}")
-    # 拒绝 link-local / 云元数据端点: 此类地址绝不可能是合法 Ollama 目标,
-    # 且是 SSRF 窃取云凭据的典型向量 (AWS/Azure/GCP metadata)。
-    if host in ("169.254.169.254", "metadata.google.internal", "metadata") or host.startswith("169.254."):
+    # 域名层面的已知元数据端点兜底 (即使本机 DNS 解析不到也被拦截)。
+    if host in ("169.254.169.254", "metadata.google.internal", "metadata"):
         raise ValueError(
             f"ollamaUrl points to a link-local/metadata endpoint, blocked for SSRF protection: {raw!r}"
         )
+    # 解析 host 为实际 IP 再校验: 拦截编码形式 (IPv6-mapped/十六进制/十进制整数)。
+    # DNS rebinding 无法在校验时刻完全消除, 但可显著收窄攻击面。
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        return raw  # 不可解析 (局域网别名等): 不误拒, 请求侧同样会失败
+    for info in infos:
+        ip_str = info[4][0].split("%")[0]  # 去掉 IPv6 scope id (fe80::1%eth0)
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        # IPv4-mapped IPv6 (::ffff:a.b.c.d) 归一回 IPv4 再判
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        if ip.is_link_local:
+            raise ValueError(
+                f"ollamaUrl resolves to link-local address {ip}, blocked for SSRF protection: {raw!r}"
+            )
     return raw
 
 

@@ -200,8 +200,8 @@ const IngestPage = () => {
       } else {
         message.success('向量数据库已清空，嵌入模型已切换');
       }
+      // loadStatus 已内部 setFileList, 不再重复 setFileList([]) (会把刚加载的列表清空)
       await loadStatus();
-      setFileList([]);
     } catch (error) {
       message.error('切换模型失败: ' + (error.response?.data?.detail || error.message || '未知错误'));
       // 持久化或清库失败时, 静默回读服务器实际模型, 避免本地与服务器不一致
@@ -309,7 +309,7 @@ const IngestPage = () => {
         if (clearing) return; // 防双击: 已在清空中则忽略 (后端 _reset_lock 为最终互斥保障)
         setClearing(true);
         try {
-          const res = await apiClient.delete(`/reset`);
+          const res = await apiClient.delete(`/reset`, { timeout: 300000 });  // 清空删 chromadb+VACUUM 实测~3min, 默认 30s 会超时
           const status = res?.data?.status;
           const detail = res?.data?.message || '';
           if (status === 'busy') {
@@ -319,8 +319,8 @@ const IngestPage = () => {
             await loadStatus();
           } else {
             message.success('向量数据库已清空');
+            // loadStatus 已内部 setFileList, 不再 setFileList([]) 清空刚加载的列表
             await loadStatus();
-            setFileList([]);
           }
         } catch (error) {
           message.error('清空数据库失败: ' + (error.response?.data?.detail || error.message || '未知错误'));

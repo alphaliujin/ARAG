@@ -203,16 +203,40 @@ class ParentChildRetriever:
 
         child_coll = self._child_coll()
         count = child_coll.count()
-        if count == 0:
-            logger.info("[SEARCH] Child collection is empty")
+        if count > 0:
+            # 常规 parent-child 模式: 在 child 搜, 命中后回查 parent
+            return self._query_collection(
+                child_coll, query, n_results, return_parents, start
+            )
+
+        # 无子块 = 纯 chunk 模式 (strategy=chunk 的 chunk 型文档入 parent collection)。
+        # 旧实现直接返回空, 导致"索引成功却搜不到内容"。
+        parent_coll = self._parent_coll()
+        if parent_coll.count() == 0:
+            logger.info("[SEARCH] Child & parent collections are both empty")
             return []
+        logger.info("[SEARCH] Child collection empty, falling back to parent (chunk mode)")
+        return self._query_collection(
+            parent_coll, query, n_results, return_parents=False, start=start
+        )
+
+    def _query_collection(
+        self,
+        coll,
+        query: str,
+        n_results: int,
+        return_parents: bool,
+        start: float,
+    ) -> List[RetrievalHit]:
+        """在指定 collection 上查询并构建命中列表 (child 或纯 chunk 的 parent 集合)."""
+        count = coll.count()
 
         # 1. 嵌入 query
         query_embedding = self.embedder.embed_query(query)
 
-        # 2. 在 child collection 搜
+        # 2. 检索
         actual_n = min(n_results, count)
-        results = child_coll.query(
+        results = coll.query(
             query_embeddings=[query_embedding],
             n_results=actual_n,
             include=["documents", "metadatas", "distances"],
@@ -252,7 +276,8 @@ class ParentChildRetriever:
             hits.append(hit)
 
         # 4. 批量回查 parent (原实现逐 hit 调 _get_parent_text, 每次 ChromaDB get,
-        # n_results 条命中 = n 次 DB 往返; 批量一次 get 全部 parent 文本)
+        # n_results 条命中 = n 次 DB 往返; 批量一次 get 全部 parent 文本)。
+        # 纯 chunk 模式 (parent 集合直查) 本身就是顶层文本, 不再回查。
         if return_parents and hits:
             parent_doc_ids = [h.metadata.get("doc_id") or h.metadata.get("parent_doc_id", "")
                               for h in hits]

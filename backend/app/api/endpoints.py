@@ -207,12 +207,18 @@ async def docscan_embed(filename: str = Query(..., description="文件名")):
     task_id = task_manager.create_task("docscan_embed", {"filename": filename})
 
     def _run():
-        info = task_manager.get_task(task_id)
-        cancel_evt = info.cancel_event if info else None
-        callback = task_manager.make_progress_callback(task_id)
-        return docscan_service.embed_file_vectors(
-            filename, progress_callback=callback, cancel_event=cancel_evt
-        )
+        # pin embedder: 任务全程持有引用计数, 并发 docscan_compare 结束后
+        # cleanup_memory 才不会把这个正在用的 embedder release 掉 (MPS 崩溃/脏向量)
+        docscan_service._pin_embedder()
+        try:
+            info = task_manager.get_task(task_id)
+            cancel_evt = info.cancel_event if info else None
+            callback = task_manager.make_progress_callback(task_id)
+            return docscan_service.embed_file_vectors(
+                filename, progress_callback=callback, cancel_event=cancel_evt
+            )
+        finally:
+            docscan_service._unpin_embedder()
 
     task_manager.run_in_thread(task_id, _run)
     return {"task_id": task_id, "status": "pending"}
@@ -301,20 +307,27 @@ async def delete_docscan_file(name: str = Query(..., description="文件名 (仅
 
         logger.info(f"[AUDIT] Delete operation: docscan file '{name}' deleted")
         os.unlink(target)
-        # 同步清理 X2MD 输出的 <stem>.md/ 目录(含 parents/children JSON 与嵌入),
-        # 否则重传同名文件时会复用过期嵌入,产生 stale 比对结果。
-        # 注意: stem 必须基于已通过路径校验的 name,且只在 docscan_dir 下 rmtree。
+        # 同步清理 X2MD 派生的切片产物, 否则重传同名文件时会复用过期嵌入产生 stale
+        # 比对结果, 且 get_docscan_stats 会误报已删文档仍已处理。
+        # 三者均在 docscan_dir 根: <stem>.md (文件, docscan.py 的 output_path)、
+        # <stem>.parents.json、<stem>.children.json; 兼容旧布局的 <stem>.md/ 目录。
         import shutil
         stem = Path(name).stem
-        chunk_dir = (docscan_dir / f"{stem}.md").resolve()
-        try:
-            chunk_dir.relative_to(docscan_dir)
-            if chunk_dir.is_dir():
-                shutil.rmtree(chunk_dir, ignore_errors=True)
-                logger.info(f"[AUDIT] Also removed orphan chunk dir: {chunk_dir.name}")
-        except ValueError:
-            # stem 解析后落在 docscan_dir 之外(理论不会发生,name 已校验过),静默跳过
-            pass
+        for derived_name in (f"{stem}.md", f"{stem}.parents.json", f"{stem}.children.json"):
+            p = (docscan_dir / derived_name).resolve()
+            try:
+                p.relative_to(docscan_dir)  # 防穿越: 必须在 docscan_dir 内
+            except ValueError:
+                continue
+            try:
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                    logger.info(f"[AUDIT] Also removed orphan chunk dir: {p.name}")
+                elif p.is_file():
+                    p.unlink()
+                    logger.info(f"[AUDIT] Also removed derived file: {p.name}")
+            except OSError as e:
+                logger.warning(f"[AUDIT] Failed to clean derived file {p.name}: {e}")
         return {"status": "success", "message": f"已删除: {name}"}
 
     try:
@@ -378,6 +391,12 @@ async def get_docscan_stats():
 @router.post("/ingest")
 async def ingest_documents(request: Optional[IngestRequest] = None):
     try:
+        # 与任务版 /tasks/ingest 互斥: 任务模式在跑时不并发执行同步版,
+        # 否则两线程同时写同一 ChromaDB/MD 目录互相覆盖
+        existing = task_manager.get_task_by_type("ingest")
+        if existing:
+            return {"status": "busy", "task_id": existing.task_id,
+                    "message": "已有入库任务在运行, 请等待完成后再试"}
         if request and request.classification_level:
             if request.classification_level not in VALID_CLASSIFICATIONS:
                 raise HTTPException(status_code=400, detail="Invalid classification level")
@@ -491,6 +510,11 @@ async def reset_database():
 async def preprocess_documents(request: PreprocessRequest):
     """预处理指定密级的文档（使用 X2MD 转换为 Markdown）"""
     try:
+        # 与任务版 /tasks/preprocess 互斥, 防同类型并发转换同一 MD 目录
+        existing = task_manager.get_task_by_type("preprocess")
+        if existing:
+            return {"status": "busy", "task_id": existing.task_id,
+                    "message": "已有预处理任务在运行, 请等待完成后再试"}
         if request.level not in DOC_LEVEL_MAP:
             raise HTTPException(status_code=400, detail=f"Invalid level: {request.level}")
 
@@ -578,6 +602,11 @@ async def run_deduplication():
     三档划分：≥0.8 高度相似 / 0.65-0.8 中度相似 / 0.5-0.65 弱相关
     """
     try:
+        # 与任务版 /tasks/dedup 互斥, 防同类型全量比对并发
+        existing = task_manager.get_task_by_type("dedup")
+        if existing:
+            return {"status": "busy", "task_id": existing.task_id,
+                    "message": "已有去重任务在运行, 请等待完成后再试"}
         dedup_service = _get_dedup_service()
         result = await asyncio.to_thread(
             dedup_service.run_deduplication,

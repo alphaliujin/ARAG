@@ -195,33 +195,38 @@ _PROMPT_EXTRACT_CONTACTS = (
 )
 
 _NOISE_KEYWORDS = frozenset({
+    # ★ 仅保留"无歧义的文档戳记"型关键词: 命中即噪声, 直接删, 不送 LLM。
+    #   泛词 (http/https、目录、日期、状态、附件、草稿、制定/审核/批准 等) 一律
+    #   移出: 它们常出现在合法正文 (官网链接、目录结构说明、修订状态行), 启发式
+    #   命中会静默吞掉真内容。这些文本改由 LLM 判定 (保守路径), LLM 不可用时
+    #   整个噪声剥离本就不执行。
+    # 页眉页脚
     "页眉", "页脚", "header", "footer",
-    "目录", "contents", "table of contents", "toc",
-    "修订记录", "版本记录", "revision", "version history",
-    "变更记录", "changelog", "修订记录",
+    # 目录/修订记录 (明确的无内容标记)
+    "table of contents", "toc", "修订记录", "版本记录", "revision",
+    "version history", "变更记录", "changelog",
+    # 版权/免责
     "版权所有", "copyright", "all rights reserved", "版权声明",
     "免责声明", "disclaimer",
-    "机密", "confidential", "保密", "绝密", "内部文件",
-    "内部资料", "internal use", "内部使用",
+    # 密级/保密戳记
+    "机密", "confidential", "保密", "绝密", "内部文件", "内部资料",
+    "internal use", "内部使用",
+    # 审批/责任人戳记
     "审批人", "审核人", "批准人", "拟定人", "复核人",
+    # 文档/文件编号
     "文档编号", "文件编号",
+    # 密级字段
     "密级", "密等",
+    # 正本/副本/草稿 (文档状态戳记)
     "正本", "副本", "草稿", "draft",
+    # 页码
     "第 1 页", "第1页", "第 2 页", "第2页",
     "page 1", "page 2", "共 1 页", "共1页", "共页",
-    "日期：", "日期:", "日期 ",
+    # 作者/部门戳记 (字段: 值 形态, 正文中罕见)
     "作者：", "作者:", "作者 ",
     "部门：", "部门:", "部门 ",
-    "公司名称", "company name", "company:",
-    "http://", "https://",
-    "绿盟科技", "nsfocus", "绿盟",
-    "文档状态", "状态：", "状态:", "status",
-    "生效日期", "失效日期", "有效期",
-    "签字", "签名", "签章",
-    "参考文件", "引用文件", "related document",
-    "附录", "appendix", "附件",
-    "制定", "审核", "批准",
-    "有限公司", "集团", "股份有限公司",
+    # 文档状态戳记
+    "文档状态",
 })
 
 _MIN_NOISE_LEN = 2
@@ -292,10 +297,12 @@ def llm_batch_strip_noise(
                 except ValueError:
                     continue
                 verdict = parts[1].strip().upper()
-                if verdict.startswith("YES") and local_idx in local_index_map:
-                    results.append((local_index_map[local_idx], 1))
-                else:
-                    results.append((local_index_map[local_idx], 0))
+                # 模型幻觉的越界编号 (如 10 条 batch 里回 "99: NO"): 跳过该行,
+                # 不要因单个坏行 KeyError 被外层 except 吞掉, 否则整个 batch 的
+                # 判定结果全部丢弃 (含已解析的合法 YES), 噪声行会静默保留。
+                if local_idx not in local_index_map:
+                    continue
+                results.append((local_index_map[local_idx], 1 if verdict.startswith("YES") else 0))
         except Exception:
             pass
 

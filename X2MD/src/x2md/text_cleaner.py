@@ -81,6 +81,20 @@ _RE_CTRL_BOM = re.compile(r'[\x00-\x08\x0b-\x0c\x0e-\x1f﻿]')
 _RE_SECTION_BREAK = re.compile(
     r'^(第[一二三四五六七八九十\d]+[章节条]|\d+[\.\s]+|[一二三四五六七八九十][、\.\s])'
 )
+# 目录/参考文献章节内的"条目行"特征: 有序号标记 (1. / 一、 / [1] / (1)) 或点线
+# (...12)。用于判断 skip-section 标题后紧跟的是不是真章节内容: 若不是 (标题后
+# 直接是正文), 立即退出跳过, 防止吞掉正文第一段。注意不单用"行尾数字"判页码,
+# 否则 "附录\n\n附表A数据 12\n\n正文" 这类正文行会被误当目录条目吞掉。
+_RE_SECTION_ENTRY = re.compile(
+    r'^\s*(?:'
+    r'\d+[、．.]?\s*[一-鿿A-Za-z]'      # "1 概述" / "1. 概述" / "1、概述"
+    r'|第[一二三四五六七八九十\d]+[章节条例]'   # "第一章"
+    r'|[一二三四五六七八九十]+[、\.]\s*[一-鿿]'  # "一、概述"
+    r'|\[\d+\]'                        # "[1] 参考文献"
+    r'|\(?\d+\)\s*[一-鿿A-Za-z]'       # "(1) 概述"
+    r')'
+    r'|\.{2,}'                          # 点线 "……12"
+)
 _RE_REPEAT_PUNCT = re.compile(r'([。！？，、；：])\1+')
 _RE_DEDUP_PUNCT = re.compile(r'[\s　，。！？；：、（）【】「」""''…—]+')
 _RE_CN_EN_NO_SPACE = re.compile(r'([一-鿿])\s+([a-zA-Z0-9])')
@@ -161,8 +175,11 @@ class TextCleaner:
     ]
 
     # URL 模式
+    # 负向后顾 (?<!\]) 跳过已是 markdown 链接目标的 URL ([text](http://...)),
+    # 否则 normalize_links 会把它再包一层 [链接: ...](...) 破坏既有链接语法;
+    # 二次 normalize 时同样靠它跳过已包裹的 URL。
     URL_PATTERN = re.compile(
-        r'https?://(?:[-\w.])+(?:[:\d]+)?(?:/(?:[\w/_.])*(?:\?(?:[\w&=%.])*)?(?:#(?:[\w.])*)?)?',
+        r'(?<!\]\()https?://(?:[-\w.])+(?:[:\d]+)?(?:/(?:[\w/_.])*(?:\?(?:[\w&=%.])*)?(?:#(?:[\w.])*)?)?',
         re.IGNORECASE
     )
 
@@ -310,6 +327,10 @@ class TextCleaner:
         filtered_lines = []
         skip_section = False
         skip_depth = 0
+        # skip-section 标题后是否已见过首个非空行: 首行必须是章节条目 (目录编号/
+        # 点线/页码) 才继续跳; 若是正文 (标题后只有单空行), 立即恢复并保留该行,
+        # 否则 "目录\n\n这是正文第一段…" 会吞掉正文第一段 (常见文档的内容丢失)。
+        first_content_seen = False
 
         for line in lines:
             original_line = line
@@ -319,6 +340,7 @@ class TextCleaner:
             if self.is_skip_section(stripped):
                 skip_section = True
                 skip_depth = 0
+                first_content_seen = False
                 continue
 
             # 检测章节结束
@@ -330,7 +352,19 @@ class TextCleaner:
                         skip_depth = 0
                     continue
                 else:
-                    if _RE_SECTION_BREAK.match(stripped):
+                    if not first_content_seen:
+                        # 首行判定: 是章节条目则继续跳 (跳过该行), 否则退出跳过保留正文
+                        first_content_seen = True
+                        if _RE_SECTION_ENTRY.match(stripped):
+                            continue
+                        skip_section = False
+                        skip_depth = 0
+                    elif _RE_SECTION_ENTRY.match(stripped):
+                        # 仍是目录条目 (如 "2. 方法……5"), 继续跳;
+                        # 必须放在 _RE_SECTION_BREAK 之前, 否则编号条目会被当成
+                        # "下一章标题" 提前结束跳过而泄漏进正文
+                        continue
+                    elif _RE_SECTION_BREAK.match(stripped):
                         skip_section = False
                         skip_depth = 0
                     elif skip_section:
@@ -417,6 +451,11 @@ class TextCleaner:
                         continue
                     inter = len(prev_tokens & para_tokens)
                     union = len(prev_tokens | para_tokens)
+                    # ★ 短段 token 集极小 (常只有标签词, 如 "合同编号: A100" 只有
+                    # {合同编号} 一个 token), Jaccard=1.0 会把 A100/A101 判为重复
+                    # 而删掉合法编号行。要求至少 2 个共同 token 才近似判重。
+                    if inter < 2:
+                        continue
                     sim = inter / union if union else 0.0
                     if sim > similarity_threshold:
                         is_similar = True

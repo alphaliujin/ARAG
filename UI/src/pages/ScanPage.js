@@ -310,21 +310,27 @@ const ScanPage = () => {
 
   // ============ 文本扫描 ============
 
+  // 文本扫描请求序号: 连续快速扫描时, 过期 (慢) 响应不得覆盖新结果/重置 loading
+  const textScanSeqRef = useRef(0);
+
   const handleTextScan = async () => {
     if (!textValue || textValue.trim().length < 10) {
       message.warning('请输入至少 10 个字符的文本内容');
       return;
     }
+    const seq = ++textScanSeqRef.current;
     setTextScanning(true);
     try {
       const result = await scanText(textValue);
+      if (seq !== textScanSeqRef.current) return; // 已过期, 丢弃
       setTextResult(result);
       message.success('文本扫描完成');
     } catch (error) {
+      if (seq !== textScanSeqRef.current) return; // 已过期, 丢弃
       const detail = error.response?.data?.detail || error.message;
       message.error(`文本扫描失败: ${detail}`);
     } finally {
-      setTextScanning(false);
+      if (seq === textScanSeqRef.current) setTextScanning(false);
     }
   };
 
@@ -616,7 +622,7 @@ const ScanPage = () => {
           </p>
         </Dragger>
 
-        {/* 操作按钮 */}
+        {/* 操作按钮 (依赖选中文件) */}
         {selectedFile && (
           <div className="card" style={{ marginTop: '16px' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -653,17 +659,20 @@ const ScanPage = () => {
                   比对
                 </Button>
               </Space>
-              {opLoading.embed && (
-                <div style={{ marginTop: 12 }}>
-                  <Progress percent={embedProgress} size="small" status="active" />
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 }}>
-                    <span style={{ color: '#666', fontSize: 12 }}>{embedMessage}</span>
-                    <Button size="small" danger icon={<StopOutlined />} onClick={handleStopEmbed}>
-                      停止
-                    </Button>
-                  </div>
-                </div>
-              )}
+            </div>
+          </div>
+        )}
+
+        {/* 生成向量进度/停止: 独立于 selectedFile, 页面刷新后恢复中的任务也要能
+            看到进度并可停止 (旧实现包在 selectedFile && 里, 刷新后恒不渲染) */}
+        {opLoading.embed && (
+          <div className="card" style={{ marginTop: '16px' }}>
+            <Progress percent={embedProgress} size="small" status="active" />
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 }}>
+              <span style={{ color: '#666', fontSize: 12 }}>{embedMessage}</span>
+              <Button size="small" danger icon={<StopOutlined />} onClick={handleStopEmbed}>
+                停止
+              </Button>
             </div>
           </div>
         )}
