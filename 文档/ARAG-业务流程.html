@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ARAG 业务流程 · 敏感信息识别系统</title>
+<style>
+/* ============ 调色板角色槽位 (dataviz 参考调色板, 已验证) ============ */
+:root {
+  --page:        #f9f9f7;
+  --surface-1:   #fcfcfb;
+  --ink-1:       #0b0b0b;
+  --ink-2:       #52514e;
+  --muted:       #898781;
+  --hairline:    #e1e0d9;
+  --axis:        #c3c2b7;
+  --border:      rgba(11,11,11,0.10);
+  /* 泳道 categorical slots 1-3 */
+  --lane-a:      #2a78d6;   /* 知识库构建 */
+  --lane-b:      #eb6834;   /* 文档检测 DocScan */
+  --lane-c:      #1baf7a;   /* 文本扫描 */
+  /* 密级 = status 色 (固定, 永不换肤; 永远配图标+文字标签) */
+  --cls-public:       #0ca30c;  /* 0Public  公开 */
+  --cls-restricted:   #fab219;  /* 1Restricted 受限 */
+  --cls-confidential: #d03b3b;  /* 2Confidential 机密 */
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    --page:      #0d0d0d;
+    --surface-1: #1a1a19;
+    --ink-1:     #ffffff;
+    --ink-2:     #c3c2b7;
+    --hairline:  #2c2c2a;
+    --axis:      #383835;
+    --border:    rgba(255,255,255,0.10);
+    --lane-a:    #3987e5;
+    --lane-b:    #d95926;
+    --lane-c:    #199e70;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --page:      #0d0d0d;
+  --surface-1: #1a1a19;
+  --ink-1:     #ffffff;
+  --ink-2:     #c3c2b7;
+  --hairline:  #2c2c2a;
+  --axis:      #383835;
+  --border:    rgba(255,255,255,0.10);
+  --lane-a:    #3987e5;
+  --lane-b:    #d95926;
+  --lane-c:    #199e70;
+  color-scheme: dark;
+}
+
+/* ============ 基础 ============ */
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink-1);
+  font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  line-height: 1.6;
+}
+.viz-root { max-width: 1280px; margin: 0 auto; padding: 32px 24px 56px; }
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.86em;
+  background: var(--hairline);
+  border-radius: 4px;
+  padding: 1px 6px;
+  color: var(--ink-2);
+}
+:focus-visible { outline: 2px solid var(--lane-a); outline-offset: 2px; }
+
+/* ============ 头部 ============ */
+.viz-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; margin-bottom: 20px; }
+.viz-header h1 { margin: 0 0 6px; font-size: 30px; font-weight: 700; letter-spacing: -0.01em; }
+.viz-header .subtitle { margin: 0; color: var(--ink-2); font-size: 15px; }
+.viz-header .desc { margin: 12px 0 0; color: var(--ink-2); font-size: 14px; max-width: 780px; }
+.chip-ver {
+  display: inline-block; margin-left: 8px; vertical-align: 2px;
+  font-size: 12px; font-weight: 600; color: var(--ink-2);
+  border: 1px solid var(--border); border-radius: 999px; padding: 1px 10px;
+}
+#themeToggle {
+  flex: none; cursor: pointer;
+  border: 1px solid var(--border); border-radius: 999px;
+  background: var(--surface-1); color: var(--ink-1);
+  padding: 7px 16px; font-size: 13px; font-weight: 600;
+}
+#themeToggle:hover { border-color: var(--axis); }
+
+/* ============ 图例 ============ */
+.legend {
+  display: flex; flex-wrap: wrap; gap: 28px;
+  padding: 14px 18px; margin-bottom: 28px;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px;
+}
+.legend-group { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; }
+.legend-title { font-size: 12px; font-weight: 700; letter-spacing: 0.06em; color: var(--muted); text-transform: uppercase; }
+.legend-item { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--ink-2); }
+.swatch { width: 11px; height: 11px; border-radius: 3px; flex: none; }
+.sw-a { background: var(--lane-a); }
+.sw-b { background: var(--lane-b); }
+.sw-c { background: var(--lane-c); }
+.sw-public       { background: var(--cls-public); }
+.sw-restricted   { background: var(--cls-restricted); }
+.sw-confidential { background: var(--cls-confidential); }
+
+/* ============ 数据流总览 ============ */
+.overview { margin-bottom: 32px; }
+.overview h2 { font-size: 15px; font-weight: 700; color: var(--ink-1); margin: 0 0 12px; }
+.overview-flow {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  padding: 16px 18px; background: var(--surface-1);
+  border: 1px solid var(--border); border-radius: 12px;
+}
+.ov-node {
+  font-size: 13px; color: var(--ink-2); padding: 6px 12px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--page);
+  white-space: nowrap;
+}
+.ov-node b { color: var(--ink-1); font-weight: 600; }
+.ov-arrow { color: var(--muted); font-size: 15px; flex: none; }
+
+/* ============ 泳道 ============ */
+.lane { margin-bottom: 30px; position: relative; }
+.lane-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.lane-head .lane-dot { width: 12px; height: 12px; border-radius: 3px; align-self: center; flex: none; }
+.lane-a .lane-dot { background: var(--lane-a); }
+.lane-b .lane-dot { background: var(--lane-b); }
+.lane-c .lane-dot { background: var(--lane-c); }
+.lane-head h2 { margin: 0; font-size: 19px; font-weight: 700; }
+.lane-head .lane-sub { color: var(--ink-2); font-size: 13px; }
+.lane-head .lane-tag {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.04em;
+  border-radius: 999px; padding: 2px 10px; color: var(--ink-2);
+  border: 1px solid var(--border); background: var(--surface-1);
+}
+
+.flow { display: flex; align-items: stretch; gap: 0; }
+.arrow { flex: none; align-self: center; color: var(--muted); font-size: 22px; padding: 0 10px; user-select: none; }
+
+/* 阶段卡片 */
+.stage {
+  position: relative;
+  flex: 1 1 0; min-width: 0;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px 16px 12px;
+}
+.lane-a .stage { border-top: 3px solid var(--lane-a); }
+.lane-b .stage { border-top: 3px solid var(--lane-b); }
+.lane-c .stage { border-top: 3px solid var(--lane-c); }
+.stage:hover { box-shadow: 0 2px 14px var(--border); }
+.stage-top { display: flex; align-items: center; gap: 9px; margin-bottom: 8px; }
+.stage-no {
+  flex: none; width: 24px; height: 24px; border-radius: 6px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 12.5px; font-weight: 700; color: var(--ink-1);
+  border: 1.5px solid;
+}
+.lane-a .stage-no { border-color: var(--lane-a); }
+.lane-b .stage-no { border-color: var(--lane-b); }
+.lane-c .stage-no { border-color: var(--lane-c); }
+.stage h3 { margin: 0; font-size: 15px; font-weight: 700; color: var(--ink-1); }
+.stage h3 .en { font-weight: 500; font-size: 12px; color: var(--muted); margin-left: 6px; }
+.stage ul { margin: 0; padding-left: 18px; font-size: 13px; color: var(--ink-2); }
+.stage li { margin: 3px 0; }
+.stage .mini-flow { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; margin: 6px 0 2px; }
+.stage .mini-flow span {
+  font-size: 12px; font-weight: 600; color: var(--ink-1);
+  border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px; background: var(--page);
+}
+.stage .mini-flow i { font-style: normal; color: var(--muted); }
+.stage-api {
+  margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--hairline);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px; color: var(--muted);
+  overflow-wrap: break-word;
+}
+
+/* 密级 chips (status 色 + 永远带文字标签) */
+.cls-line { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.cls-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; font-weight: 600; color: var(--ink-1);
+  border: 1px solid var(--border); border-radius: 999px; padding: 2px 10px;
+  background: var(--page);
+}
+.cls-chip i { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.cls-chip.public       i { background: var(--cls-public); }
+.cls-chip.restricted   i { background: var(--cls-restricted); }
+.cls-chip.confidential i { background: var(--cls-confidential); }
+
+/* 卡片悬浮提示 (实现细节) */
+.stage::after {
+  content: attr(data-tip);
+  display: block; opacity: 0; pointer-events: none;
+  position: absolute; top: calc(100% + 10px); left: 50%; transform: translateX(-50%);
+  width: max-content; max-width: 340px; z-index: 30;
+  background: var(--surface-1); color: var(--ink-2);
+  border: 1px solid var(--axis); border-radius: 8px;
+  font-size: 12px; line-height: 1.55; padding: 10px 13px;
+  box-shadow: 0 6px 24px var(--border);
+  white-space: pre-line; text-align: left;
+  transition: opacity .15s ease;
+}
+.stage:hover::after, .stage:focus-within::after { opacity: 1; }
+
+/* ============ 支撑层 ============ */
+.support { margin: 34px 0 30px; }
+.support h2 { font-size: 15px; font-weight: 700; margin: 0 0 12px; }
+.support-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 12px; }
+.sup-card {
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px;
+  padding: 14px 16px;
+}
+.sup-card h3 { margin: 0 0 6px; font-size: 14px; font-weight: 700; color: var(--ink-1); }
+.sup-card p { margin: 0; font-size: 13px; color: var(--ink-2); }
+.sup-card p code { font-size: 12px; }
+
+/* ============ 表格视图 ============ */
+.table-view { margin-bottom: 12px; }
+.table-view h2 { font-size: 15px; font-weight: 700; margin: 0 0 12px; }
+.table-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-1); }
+table { border-collapse: collapse; width: 100%; font-size: 13px; min-width: 860px; }
+thead th {
+  text-align: left; font-size: 11.5px; font-weight: 700; letter-spacing: 0.05em;
+  text-transform: uppercase; color: var(--muted);
+  padding: 12px 14px; border-bottom: 1px solid var(--axis);
+  white-space: nowrap;
+}
+tbody td { padding: 10px 14px; border-bottom: 1px solid var(--hairline); color: var(--ink-2); vertical-align: top; }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover td { background: var(--page); }
+td b { color: var(--ink-1); font-weight: 600; }
+td .row-lane { font-size: 11px; font-weight: 700; letter-spacing: 0.04em; color: var(--muted); white-space: nowrap; }
+td code { font-size: 11.5px; }
+
+/* ============ 页脚 ============ */
+footer { margin-top: 28px; padding-top: 16px; border-top: 1px solid var(--hairline); font-size: 12px; color: var(--muted); }
+
+/* ============ 响应式 ============ */
+@media (max-width: 1080px) {
+  .flow { flex-direction: column; align-items: stretch; gap: 10px; }
+  .arrow { transform: rotate(90deg); padding: 2px 0; }
+}
+@media (max-width: 640px) {
+  .viz-root { padding: 20px 14px 40px; }
+  .viz-header { flex-direction: column; }
+  .viz-header h1 { font-size: 24px; }
+}
+@media print {
+  .stage::after { display: none; }
+  body { background: #fff; }
+}
+</style>
+</head>
+<body>
+<div class="viz-root">
+
+  <!-- ============ 头部 ============ -->
+  <header class="viz-header">
+    <div>
+      <h1>ARAG 业务流程<span class="chip-ver">v0.2.0</span></h1>
+      <p class="subtitle">敏感信息识别系统 · Sensitive Information Detection System — 基于 RAG 的文档涉密信息检测</p>
+      <p class="desc">
+        先建库, 后检测：把按密级分类的敏感文档预处理、切片、向量化, 建立<b>敏感信息 RAG 库</b>;
+        再对用户上传的待检文档 / 文本进行<b>层级比对</b>, 输出各密级相似度, 识别其中是否含有敏感 / 涉密内容。
+      </p>
+    </div>
+    <button id="themeToggle" type="button">🌙 深色模式</button>
+  </header>
+
+  <!-- ============ 图例 ============ -->
+  <section class="legend" aria-label="图例">
+    <div class="legend-group">
+      <span class="legend-title">业务泳道</span>
+      <span class="legend-item"><i class="swatch sw-a"></i>知识库构建</span>
+      <span class="legend-item"><i class="swatch sw-b"></i>文档检测 DocScan</span>
+      <span class="legend-item"><i class="swatch sw-c"></i>文本扫描</span>
+    </div>
+    <div class="legend-group">
+      <span class="legend-title">密级</span>
+      <span class="legend-item"><i class="swatch sw-public"></i>0Public 公开</span>
+      <span class="legend-item"><i class="swatch sw-restricted"></i>1Restricted 受限</span>
+      <span class="legend-item"><i class="swatch sw-confidential"></i>2Confidential 机密</span>
+    </div>
+  </section>
+
+  <!-- ============ 数据流总览 ============ -->
+  <section class="overview" aria-label="核心数据流总览">
+    <h2>核心数据流总览</h2>
+    <div class="overview-flow">
+      <span class="ov-node"><b>源文档</b> DOC/&lt;密级&gt;/</span><span class="ov-arrow">→</span>
+      <span class="ov-node">① 预处理 <b>X2MD</b> 转换·清洗·父子块切片</span><span class="ov-arrow">→</span>
+      <span class="ov-node"><b>切片</b> MD/&lt;密级&gt;/</span><span class="ov-arrow">→</span>
+      <span class="ov-node">② 入库 <b>MD2RAG</b> bge-m3 嵌入 → ChromaDB 分集合</span><span class="ov-arrow">→</span>
+      <span class="ov-node"><b>RAG 库</b> vector_db/ 三密级 × 父子块</span><span class="ov-arrow">→</span>
+      <span class="ov-node">③ <b>跨密级去重</b></span><span class="ov-arrow">→</span>
+      <span class="ov-node">④ 待检文档 / 文本 <b>层级比对</b></span><span class="ov-arrow">→</span>
+      <span class="ov-node"><b>密级相似度结果</b> /ARAG-end/</span>
+    </div>
+  </section>
+
+  <!-- ============ 泳道 A · 知识库构建 ============ -->
+  <section class="lane lane-a" aria-label="流程一 知识库构建">
+    <div class="lane-head">
+      <span class="lane-dot"></span>
+      <h2>流程一 · 知识库构建</h2>
+      <span class="lane-sub">把敏感资料建成按密级分类的 RAG 库</span>
+      <span class="lane-tag">后台任务 · 进度可查 · 可取消</span>
+    </div>
+    <div class="flow">
+      <article class="stage" data-tip="实现: GET /scan-source-dir 扫描 DOC/&lt;密级&gt; 目录
+前端「数据库」页展示各密级待处理文件列表">
+        <div class="stage-top"><span class="stage-no">1</span><h3>源文档准备</h3></div>
+        <ul>
+          <li>文档按密级放入 <code>DOC/</code> 目录</li>
+          <li>支持扫描源目录查看待处理文件</li>
+        </ul>
+        <div class="cls-line">
+          <span class="cls-chip public"><i></i>0Public 公开</span>
+          <span class="cls-chip restricted"><i></i>1Restricted 受限</span>
+          <span class="cls-chip confidential"><i></i>2Confidential 机密</span>
+        </div>
+        <div class="stage-api">GET /api/v1/scan-source-dir</div>
+      </article>
+      <span class="arrow" aria-hidden="true">→</span>
+
+      <article class="stage" data-tip="实现: services/preprocess.py → 调用 X2MD
+失败文件可 POST /preprocess/retry 单独重试
+中文规范化: services/chinese_norm.py">
+        <div class="stage-top"><span class="stage-no">2</span><h3>预处理<span class="en">X2MD</span></h3></div>
+        <ul>
+          <li>多格式 → Markdown：PDF / DOCX / XLSX / PPTX / HTML / 图片 / TXT</li>
+          <li>可选：OCR (Tesseract) · 表格提取 · LLM 摘要 (qwen3:14b)</li>
+          <li>切片参数 <code>chunk_size</code> / <code>chunk_overlap</code> 可调</li>
+        </ul>
+        <div class="mini-flow"><span>转换</span><i>→</i><span>清洗</span><i>→</i><span>父子块切片</span></div>
+        <div class="stage-api">POST /api/v1/tasks/preprocess<br>输出 MD/&lt;密级&gt;/*.md + parents/children.json</div>
+      </article>
+      <span class="arrow" aria-hidden="true">→</span>
+
+      <article class="stage" data-tip="实现: services/ingestion.py → MD2RAG indexer
+按 source 判断已索引 → 增量入库; force=true 全量重建
+嵌入模型切换 (ollama-bge-m3 / mps-bge-m3) 会持久化 + 清库 + 重建 embedding_fn">
+        <div class="stage-top"><span class="stage-no">3</span><h3>入库<span class="en">MD2RAG</span></h3></div>
+        <ul>
+          <li>Ollama <code>bge-m3</code> 嵌入（1024 维）</li>
+          <li>写入 ChromaDB，按密级分集合</li>
+          <li><code>md2rag_{密级}_{parent|child}</code> 共 6 个集合</li>
+          <li>增量入库 · 支持全量重建</li>
+        </ul>
+        <div class="stage-api">POST /api/v1/tasks/ingest<br>输出 vector_db/ 持久化向量库</div>
+      </article>
+      <span class="arrow" aria-hidden="true">→</span>
+
+      <article class="stage" data-tip="实现: services/dedup.py
+报告分档写入 dedup_results/ (md + json)
+auto_dedup 自动删除为不可逆操作, 默认关闭; 亦可人工审查后 /dedup/apply">
+        <div class="stage-top"><span class="stage-no">4</span><h3>跨密级去重</h3></div>
+        <ul>
+          <li>跨密级比对子块相似度</li>
+          <li>高密级库中与低密级重复的块 → 删除</li>
+          <li>结果分档报告 · 可人工审查后应用</li>
+        </ul>
+        <div class="stage-api">POST /api/v1/tasks/dedup · /dedup/apply</div>
+      </article>
+    </div>
+  </section>
+
+  <!-- ============ 泳道 B · 文档检测 DocScan ============ -->
+  <section class="lane lane-b" aria-label="流程二 文档检测 DocScan">
+    <div class="lane-head">
+      <span class="lane-dot"></span>
+      <h2>流程二 · 文档检测<span class="en" style="font-weight:500;font-size:13px;color:var(--muted);margin-left:6px;">DocScan</span></h2>
+      <span class="lane-sub">上传待检文档，层级比对判定涉密相似度</span>
+      <span class="lane-tag">上传 → 预处理 → 嵌入 → 层级比对</span>
+    </div>
+    <div class="flow">
+      <article class="stage" data-tip="实现: api/endpoints.py scan_document
+先校验扩展名白名单再读 body; 1MB 分块流式写盘
+超过 50MB 自动删除已写残骸; 文件名防路径穿越, 重名自动加后缀">
+        <div class="stage-top"><span class="stage-no">1</span><h3>上传待检文档</h3></div>
+        <ul>
+          <li>支持 PDF / DOCX / XLSX / PPTX / HTML / MD / TXT</li>
+          <li>大小上限 50MB</li>
+          <li>仅保存至 <code>DocScan/</code>，不自动处理</li>
+          <li>防路径穿越 · 重名自动加后缀</li>
+        </ul>
+        <div class="stage-api">POST /api/v1/scan/file</div>
+      </article>
+      <span class="arrow" aria-hidden="true">→</span>
+
+      <article class="stage" data-tip="实现: services/docscan.py preprocess_file
+参数: chunk_strategy / enable_llm / encoding / extract_tables /
+chunk_size / chunk_overlap / ocr_lang / enable_ocr">
+        <div class="stage-top"><span class="stage-no">2</span><h3>预处理</h3></div>
+        <ul>
+          <li>X2MD 转换 + 父子块切片</li>
+          <li>参数与入库侧一致、可单独调整</li>
+        </ul>
+        <div class="stage-api">POST /api/v1/docscan/preprocess<br>输出 *.parents.json / *.children.json</div>
+      </article>
+      <span class="arrow" aria-hidden="true">→</span>
+
+      <article class="stage" data-tip="实现: services/docscan.py embed_file_vectors
+经 task_manager 后台执行, 同类任务防重复启动
+进度轮询 GET /tasks/{id}, 支持取消">
+        <div class="stage-top"><span class="stage-no">3</span><h3>嵌入</h3></div>
+        <ul>
+          <li>读取切片 → 批量嵌入</li>
+          <li>向量写入 JSON 带标记</li>
+          <li>后台任务 · 进度可查 · 可取消</li>
+        </ul>
+        <div class="stage-api">POST /api/v1/docscan/embed</div>
+      </article>
+      <span class="arrow" aria-hidden="true">→</span>
+
+      <article class="stage" data-tip="实现: services/docscan.py compare_file_hierarchical
+SKIP_THRESHOLD = 80%: 某级超阈值则跳过下级比对
+信号融合: 向量相似度 + n-gram 文本重叠 + 单文档内最长连续匹配段,
+可选 bge-reranker-v2-m3 重排序融合; 比对结束自动释放 reranker (~1GB) 内存">
+        <div class="stage-top"><span class="stage-no">4</span><h3>层级比对<span class="en" style="font-weight:600;font-size:12px;color:var(--muted);margin-left:6px;">核心</span></h3></div>
+        <ul>
+          <li><b>摘要 → 父块 → 子块</b> 逐级与三密级库比对</li>
+          <li>某级相似度 ≥ 80% → 跳过下级</li>
+          <li>多信号融合打分</li>
+        </ul>
+        <div class="mini-flow"><span>摘要向量</span><i>→</i><span>父块向量</span><i>→</i><span>子块向量</span></div>
+        <div class="stage-api">POST /api/v1/docscan/compare<br>输出 /ARAG-end/public:0.85,restricted:0.72,…</div>
+      </article>
+    </div>
+  </section>
+
+  <!-- ============ 泳道 C · 文本扫描 ============ -->
+  <section class="lane lane-c" aria-label="流程三 文本扫描">
+    <div class="lane-head">
+      <span class="lane-dot"></span>
+      <h2>流程三 · 文本扫描</h2>
+      <span class="lane-sub">粘贴文本即时检测敏感信息</span>
+      <span class="lane-tag">即时</span>
+    </div>
+    <div class="flow">
+      <article class="stage" data-tip="前端「扫描检测」页 → 文本扫描标签页">
+        <div class="stage-top"><span class="stage-no">1</span><h3>输入文本</h3></div>
+        <ul>
+          <li>直接粘贴待检文本</li>
+          <li>≥ 10 字符才可分析</li>
+        </ul>
+        <div class="stage-api">POST /api/v1/scan/text</div>
+      </article>
+      <span class="arrow" aria-hidden="true">→</span>
+
+      <article class="stage" data-tip="实现: services/scanner.py scan_text → _scan_chunks
+逐块检索三级库; _find_matching_positions 在原文定位命中片段">
+        <div class="stage-top"><span class="stage-no">2</span><h3>分块比对</h3></div>
+        <ul>
+          <li>文本切块 → 逐块与三级库检索</li>
+          <li>相似度打分 + 原文片段定位</li>
+        </ul>
+        <div class="stage-api">server 内部处理</div>
+      </article>
+      <span class="arrow" aria-hidden="true">→</span>
+
+      <article class="stage" data-tip="前端展示 segments 明细 + summary_by_level 汇总">
+        <div class="stage-top"><span class="stage-no">3</span><h3>结果输出</h3></div>
+        <ul>
+          <li>各密级相似度汇总</li>
+          <li>命中片段位置标注</li>
+        </ul>
+        <div class="stage-api">前端渲染结果</div>
+      </article>
+    </div>
+  </section>
+
+  <!-- ============ 支撑层 ============ -->
+  <section class="support" aria-label="支撑层">
+    <h2>支撑层 · 公共能力</h2>
+    <div class="support-grid">
+      <div class="sup-card">
+        <h3>🗂 后台任务管理</h3>
+        <p>preprocess / ingest / dedup / docscan_embed 异步执行; 进度轮询、可取消、同类任务防重。<code>services/task_manager.py</code></p>
+      </div>
+      <div class="sup-card">
+        <h3>⚙️ 运行时配置</h3>
+        <p>相似度阈值、切片参数、上传限制、嵌入模型等, 前端「设置」页动态调整, 持久化于 <code>runtime_settings.json</code>。</p>
+      </div>
+      <div class="sup-card">
+        <h3>🔐 安全防护</h3>
+        <p>API Key 认证中间件（Key 为空自动跳过）; CORS 白名单; 路径穿越防护; 上传扩展名白名单。<code>middleware/auth.py</code></p>
+      </div>
+      <div class="sup-card">
+        <h3>🧠 向量基础设施</h3>
+        <p>Ollama <code>bge-m3</code>（1024 维嵌入）; ChromaDB 持久化于 <code>vector_db/</code>; 可选 <code>bge-reranker-v2-m3</code> 重排序。<code>services/vector_db.py</code></p>
+      </div>
+      <div class="sup-card">
+        <h3>📄 文档转换工具</h3>
+        <p><code>X2MD</code> 多格式转 Markdown; <code>MD2RAG</code> 切片向量化入库; 可选 Tesseract OCR / qwen3:14b 摘要。</p>
+      </div>
+      <div class="sup-card">
+        <h3>🚀 部署形态</h3>
+        <p>单进程 uvicorn <code>:8000</code> 同源服务前端 + API, 无需 nginx / Node; <code>start.sh</code> / <code>stop.sh</code> 一键启停。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 表格视图 ============ -->
+  <section class="table-view" aria-label="阶段总览表">
+    <h2>阶段总览表</h2>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>流程</th><th>阶段</th><th>入口（页面 · API）</th><th>输入</th><th>关键处理</th><th>输出</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td rowspan="4"><span class="row-lane">知识库构建</span></td>
+            <td><b>1 源文档准备</b></td><td>数据库页 · <code>GET /scan-source-dir</code></td>
+            <td><code>DOC/&lt;密级&gt;/</code> 源文档</td><td>按密级分目录存放</td><td>待处理文档清单</td>
+          </tr>
+          <tr>
+            <td><b>2 预处理</b></td><td>预处理页 · <code>POST /tasks/preprocess</code></td>
+            <td>DOC 源文档</td><td>X2MD 转换 → 清洗 → 父子块切片</td><td><code>MD/&lt;密级&gt;/*.md</code> + parents/children.json</td>
+          </tr>
+          <tr>
+            <td><b>3 入库</b></td><td>入库页 · <code>POST /tasks/ingest</code></td>
+            <td>MD 切片</td><td>bge-m3 嵌入 → ChromaDB 按密级分集合</td><td>vector_db 6 集合（3 密级 × parent/child）</td>
+          </tr>
+          <tr>
+            <td><b>4 跨密级去重</b></td><td>去重页 · <code>POST /tasks/dedup</code> → <code>/dedup/apply</code></td>
+            <td>各密级子块</td><td>子块相似度 ≥ 阈值 → 删除高密级重复块</td><td>去重报告 + 净化后的库</td>
+          </tr>
+          <tr>
+            <td rowspan="4"><span class="row-lane">文档检测 DocScan</span></td>
+            <td><b>1 上传</b></td><td>扫描页 · <code>POST /scan/file</code></td>
+            <td>待检文档（≤ 50MB）</td><td>仅保存至 <code>DocScan/</code></td><td>待检文件</td>
+          </tr>
+          <tr>
+            <td><b>2 预处理</b></td><td>扫描页 · <code>POST /docscan/preprocess</code></td>
+            <td>待检文件</td><td>X2MD 转换 + 切片</td><td>切片 JSON</td>
+          </tr>
+          <tr>
+            <td><b>3 嵌入</b></td><td>扫描页 · <code>POST /docscan/embed</code></td>
+            <td>切片</td><td>批量向量化（后台任务）</td><td>向量 JSON 带标记</td>
+          </tr>
+          <tr>
+            <td><b>4 层级比对</b></td><td>扫描页 · <code>POST /docscan/compare</code></td>
+            <td>摘要 / 父 / 子向量</td><td>逐级比对 · 超阈值跳过 · 多信号融合</td><td><code>/ARAG-end/</code> 密级相似度</td>
+          </tr>
+          <tr>
+            <td rowspan="2"><span class="row-lane">文本扫描</span></td>
+            <td><b>1 输入</b></td><td>扫描页 · <code>POST /scan/text</code></td>
+            <td>粘贴文本（≥ 10 字）</td><td>—</td><td>—</td>
+          </tr>
+          <tr>
+            <td><b>2 分块比对</b></td><td>server 内部</td>
+            <td>文本块</td><td>逐块与三级库检索 · 片段定位</td><td>密级汇总 + 位置标注</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    数据来源：README.md · backend/app/api/endpoints.py · backend/app/services/* · UI/src/pages/*　|　ARAG v0.2.0　|　生成于 2026-09-12　|　悬停阶段卡片可查看实现细节
+  </footer>
+</div>
+
+<script>
+(function () {
+  var root = document.documentElement;
+  var btn = document.getElementById('themeToggle');
+  function storedTheme() { try { return localStorage.getItem('arag-theme'); } catch (e) { return null; } }
+  function systemDark() { return window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches; }
+  function currentTheme() {
+    var t = storedTheme();
+    if (t === 'light' || t === 'dark') return t;
+    return systemDark() ? 'dark' : 'light';
+  }
+  function render() {
+    var t = currentTheme();
+    root.dataset.theme = t;
+    btn.textContent = t === 'dark' ? '☀️ 浅色模式' : '🌙 深色模式';
+  }
+  btn.addEventListener('click', function () {
+    var next = currentTheme() === 'dark' ? 'light' : 'dark';
+    try { localStorage.setItem('arag-theme', next); } catch (e) {}
+    render();
+  });
+  render();
+})();
+</script>
+</body>
+</html>

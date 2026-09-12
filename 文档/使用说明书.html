@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ARAG 敏感信息识别系统 · 使用说明书</title>
+<style>
+/* ============ 绿盟 UI5.0 品牌色 + 深色模式 ============ */
+:root {
+  --page:        #f7f8fa;
+  --surface:     #ffffff;
+  --ink:         #2e2e2e;
+  --ink-2:       #535353;
+  --muted:       #7e7e7e;
+  --hint:        #aaaaaa;
+  --accent:      #55a722;   /* 品牌主色 */
+  --accent-text: #398013;   /* 深绿（正文级对比度 4.9:1） */
+  --accent-hover:#68b92e;
+  --accent-bg:   #eef6e8;   /* 选中背景 */
+  --accent-border:#cfe6c0;
+  --hairline:    #ebeef2;
+  --border:      #dee0e3;
+  --warn:        #fa8c16;
+  --error:       #ec4f4f;
+  --error-bg:    #fdeded;
+  --code-bg:     #f0f1f3;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    --page:        #0d0d0d;
+    --surface:     #1a1a19;
+    --ink:         #e8e8e6;
+    --ink-2:       #c3c2b7;
+    --muted:       #8a8a85;
+    --hint:        #6e6e69;
+    --accent:      #68b92e;
+    --accent-text: #85d857;
+    --accent-hover:#7ed95a;
+    --accent-bg:   #22301b;
+    --accent-border:#33482a;
+    --hairline:    #2c2c2a;
+    --border:      #383835;
+    --warn:        #ffa940;
+    --error:       #ff7875;
+    --error-bg:    #3a2320;
+    --code-bg:     #242423;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --page:        #0d0d0d;
+  --surface:     #1a1a19;
+  --ink:         #e8e8e6;
+  --ink-2:       #c3c2b7;
+  --muted:       #8a8a85;
+  --hint:        #6e6e69;
+  --accent:      #68b92e;
+  --accent-text: #85d857;
+  --accent-hover:#7ed95a;
+  --accent-bg:   #22301b;
+  --accent-border:#33482a;
+  --hairline:    #2c2c2a;
+  --border:      #383835;
+  --warn:        #ffa940;
+  --error:       #ff7875;
+  --error-bg:    #3a2320;
+  --code-bg:     #242423;
+  color-scheme: dark;
+}
+
+/* ============ 基础 ============ */
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0; background: var(--page); color: var(--ink);
+  font-family: 'PingFang SC', 'Helvetica Neue', system-ui, -apple-system, sans-serif;
+  line-height: 1.7;
+}
+a { color: var(--accent-text); text-decoration: none; }
+a:hover { text-decoration: underline; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.88em; background: var(--code-bg); border-radius: 4px;
+  padding: 1px 6px; color: var(--ink-2);
+}
+pre {
+  background: var(--code-bg); border: 1px solid var(--border); border-radius: 4px;
+  padding: 14px 16px; overflow-x: auto; font-size: 13px;
+}
+pre code { background: none; padding: 0; }
+
+/* ============ 顶栏 ============ */
+.topbar {
+  position: sticky; top: 0; z-index: 50;
+  background: var(--surface); border-bottom: 1px solid var(--hairline);
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 24px;
+}
+.topbar .brand { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.topbar h1 { margin: 0; font-size: 17px; font-weight: 600; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.topbar .ver { font-size: 12px; color: var(--muted); white-space: nowrap; }
+#themeToggle {
+  flex: none; cursor: pointer; border: 1px solid var(--border); border-radius: 4px;
+  background: var(--surface); color: var(--ink); padding: 6px 14px;
+  font-size: 13px; font-family: inherit;
+}
+#themeToggle:hover { border-color: var(--accent-hover); }
+
+/* ============ 主布局 ============ */
+.layout { display: flex; gap: 32px; max-width: 1180px; margin: 0 auto; padding: 28px 24px 64px; }
+
+/* 目录侧栏 */
+.toc {
+  flex: none; width: 220px; position: sticky; top: 76px; align-self: flex-start;
+  font-size: 13.5px;
+}
+.toc h2 { font-size: 12px; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+.toc ol { list-style: none; margin: 0; padding: 0; }
+.toc li { margin: 0; }
+.toc a {
+  display: block; padding: 5px 10px; border-radius: 4px; color: var(--ink-2);
+  border-left: 2px solid transparent;
+}
+.toc a:hover { background: var(--accent-bg); color: var(--accent-text); text-decoration: none; }
+.toc a.active { background: var(--accent-bg); color: var(--accent-text); border-left-color: var(--accent); font-weight: 600; }
+
+/* 正文 */
+.main { flex: 1; min-width: 0; }
+.hero { margin-bottom: 28px; }
+.hero h2 { font-size: 26px; margin: 0 0 8px; font-weight: 600; }
+.hero p { margin: 0 0 14px; color: var(--ink-2); font-size: 14.5px; max-width: 720px; }
+.hero .tags { display: flex; gap: 8px; flex-wrap: wrap; }
+.tag {
+  font-size: 12px; color: var(--ink-2); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 999px; padding: 2px 12px;
+}
+
+section.chapter { margin-bottom: 36px; scroll-margin-top: 76px; }
+section.chapter h2 {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 19px; font-weight: 600; margin: 0 0 14px; padding-bottom: 8px;
+  border-bottom: 1px solid var(--hairline);
+}
+section.chapter h2 .no {
+  flex: none; width: 26px; height: 26px; border-radius: 4px;
+  background: var(--accent); color: #fff; font-size: 13px; font-weight: 600;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+section.chapter h3 { font-size: 15.5px; font-weight: 600; margin: 20px 0 8px; }
+section.chapter h3 .en { font-weight: 400; font-size: 12.5px; color: var(--muted); margin-left: 6px; }
+section.chapter p, section.chapter li { font-size: 14px; color: var(--ink-2); }
+section.chapter ul, section.chapter ol { padding-left: 22px; margin: 8px 0; }
+section.chapter li { margin: 4px 0; }
+section.chapter li b { color: var(--ink); }
+
+.note {
+  border-left: 3px solid var(--accent); background: var(--accent-bg);
+  border-radius: 0 4px 4px 0; padding: 10px 14px; margin: 12px 0;
+  font-size: 13.5px; color: var(--ink-2);
+}
+.warn {
+  border-left: 3px solid var(--warn); background: var(--surface);
+  border: 1px solid var(--border); border-left-width: 3px; border-left-color: var(--warn);
+  border-radius: 4px; padding: 10px 14px; margin: 12px 0; font-size: 13.5px;
+}
+.warn b { color: var(--ink); }
+
+/* 表格 */
+.table-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); margin: 12px 0; }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; min-width: 560px; }
+thead th {
+  text-align: left; background: var(--page); color: var(--ink);
+  font-size: 13px; font-weight: 600; padding: 10px 14px;
+  border-bottom: 1px solid var(--hairline); white-space: nowrap;
+}
+tbody td { padding: 10px 14px; border-bottom: 1px solid var(--hairline); color: var(--ink-2); vertical-align: top; }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover td { background: var(--accent-bg); }
+td b { color: var(--ink); }
+td code { font-size: 12.5px; }
+
+/* 步骤条 */
+.steps { counter-reset: step; list-style: none; padding-left: 0; margin: 10px 0; }
+.steps li { counter-increment: step; position: relative; padding-left: 34px; margin: 8px 0; }
+.steps li::before {
+  content: counter(step);
+  position: absolute; left: 0; top: 2px; width: 22px; height: 22px;
+  border-radius: 50%; background: var(--accent-bg); border: 1.5px solid var(--accent);
+  color: var(--accent-text); font-size: 12px; font-weight: 600;
+  display: flex; align-items: center; justify-content: center;
+}
+
+footer {
+  border-top: 1px solid var(--hairline); padding: 20px 24px 40px;
+  text-align: center; font-size: 12px; color: var(--hint);
+}
+
+/* ============ 响应式 ============ */
+@media (max-width: 900px) {
+  .layout { flex-direction: column; padding: 20px 14px 48px; }
+  .toc { width: 100%; position: static; }
+  .toc ol { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 2px; }
+  .toc a { border-left: none; border-bottom: 2px solid transparent; }
+  .toc a.active { border-bottom-color: var(--accent); }
+  .topbar { padding: 10px 14px; }
+}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <h1>ARAG 敏感信息识别系统 · 使用说明书</h1>
+    <span class="ver">v0.2.0 · MIT · 2026-09-12</span>
+  </div>
+  <button id="themeToggle" type="button">🌙 深色模式</button>
+</header>
+
+<div class="layout">
+
+  <nav class="toc" aria-label="目录">
+    <h2>目录</h2>
+    <ol>
+      <li><a href="#c1">1 · 软件简介</a></li>
+      <li><a href="#c2">2 · 环境与部署</a></li>
+      <li><a href="#c3">3 · 界面总览</a></li>
+      <li><a href="#c4">4 · 知识库构建</a></li>
+      <li><a href="#c5">5 · 文档检测 DocScan</a></li>
+      <li><a href="#c6">6 · 文本扫描</a></li>
+      <li><a href="#c7">7 · 系统设置</a></li>
+      <li><a href="#c8">8 · 数据库管理</a></li>
+      <li><a href="#c9">9 · 常见问题 FAQ</a></li>
+      <li><a href="#c10">10 · 安全与数据说明</a></li>
+    </ol>
+  </nav>
+
+  <main class="main">
+
+    <div class="hero">
+      <h2>基于 RAG 的文档涉密信息检测系统</h2>
+      <p>核心逻辑「先建库、后检测」：把按密级分类的敏感文档预处理、切片、向量化，建立敏感信息 RAG 库；再对待检文档 / 文本进行层级比对，输出各密级相似度，辅助判定涉密内容。</p>
+      <div class="tags">
+        <span class="tag">文档外发审批</span>
+        <span class="tag">涉密定级评审</span>
+        <span class="tag">数据不出内网</span>
+        <span class="tag">三密级：公开 · 受限 · 机密</span>
+      </div>
+    </div>
+
+    <!-- 1 -->
+    <section class="chapter" id="c1">
+      <h2><span class="no">1</span>软件简介</h2>
+      <p>ARAG 是一款<strong>基于 RAG 的文档涉密信息检测系统</strong>，通过向量余弦比对判别文档中是否存在敏感信息，用于<strong>辅助决策</strong>（而非自动裁决）。</p>
+      <ol class="steps">
+        <li><b>建库</b>：把按密级分类的敏感文档预处理、切片、向量化，建立敏感信息 RAG 库；</li>
+        <li><b>检测</b>：对待检文档 / 文本进行层级比对（摘要 → 父块 → 子块），输出各密级相似度。</li>
+      </ol>
+      <p>三个密级：<code>0Public</code> 公开 · <code>1Restricted</code> 受限 · <code>2Confidential</code> 机密。</p>
+    </section>
+
+    <!-- 2 -->
+    <section class="chapter" id="c2">
+      <h2><span class="no">2</span>环境要求与安装部署</h2>
+      <h3>2.1 环境要求</h3>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>组件</th><th>要求</th></tr></thead>
+          <tbody>
+            <tr><td><b>Python</b></td><td>≥ 3.9（后端 FastAPI + uvicorn）</td></tr>
+            <tr><td><b>Ollama</b></td><td>需拉取嵌入模型 <code>bge-m3:latest</code>（1024 维，约 1.2 GB）</td></tr>
+            <tr><td><b>可选</b></td><td><code>qwen3:14b</code>（LLM 摘要）· bge-reranker-v2-m3（重排序）· PaddleOCR / Tesseract（OCR）</td></tr>
+            <tr><td><b>浏览器</b></td><td>现代浏览器（Chrome / Edge / Safari）</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <h3>2.2 目录约定（勿随意改动）</h3>
+      <pre><code>ARAG/
+├── DOC/          # 源文档输入（按密级分 3 个子目录）
+├── MD/           # 预处理产物（Markdown + 切片 JSON）
+├── vector_db/    # ChromaDB 向量库（6 个集合）
+├── DocScan/      # 待检文档暂存与中间产物
+├── dedup_results/# 去重报告与删除备份
+└── backend/ UI/ X2MD/ MD2RAG/   # 代码</code></pre>
+      <h3>2.3 启动与停止</h3>
+      <pre><code>./start.sh            # 一键启动全部（开发模式：前端 :3000 + 后端 :8000）
+./start.sh front      # 仅前端
+./start.sh back       # 仅后端
+./start.sh status     # 查看服务状态
+./start.sh stop       # 或 ./stop.sh：停止全部</code></pre>
+      <ul>
+        <li><b>开发模式</b>：访问 <code>http://localhost:3000</code></li>
+        <li><b>部署模式</b>：若 <code>UI/build</code> 存在，后端单进程同源服务前端 + API，直接访问 <code>http://localhost:8000</code>（无需 nginx / Node）</li>
+      </ul>
+      <h3>2.4 API Key 认证（可选）</h3>
+      <p>在 <code>.env</code> 中设置 <code>API_KEY</code> 即启用 API 认证中间件；留空（且 <code>AUTH_DISABLED=True</code>，仅限开发）则跳过认证。</p>
+    </section>
+
+    <!-- 3 -->
+    <section class="chapter" id="c3">
+      <h2><span class="no">3</span>界面总览</h2>
+      <p>顶部导航共 6 个页面，推荐使用顺序即导航顺序：</p>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>页面</th><th>功能</th></tr></thead>
+          <tbody>
+            <tr><td><b>文件预处理</b></td><td>① 源文档转 Markdown + 父子块切片</td></tr>
+            <tr><td><b>数据入库</b></td><td>② 切片向量化写入 ChromaDB</td></tr>
+            <tr><td><b>数据优化</b></td><td>③ 跨密级去重（可选）</td></tr>
+            <tr><td><b>文档扫描</b></td><td>④ 上传待检文档做 DocScan 检测 / 文本即时扫描</td></tr>
+            <tr><td><b>数据库管理</b></td><td>查看各密级统计、重置数据库</td></tr>
+            <tr><td><b>系统设置</b></td><td>阈值、切片参数、上传限制、嵌入模型等</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note">预处理 / 入库 / 去重 / 嵌入均为<strong>后台任务</strong>：页面可看进度、可取消；关闭浏览器不影响任务执行，重开页面自动恢复进度轮询。</div>
+    </section>
+
+    <!-- 4 -->
+    <section class="chapter" id="c4">
+      <h2><span class="no">4</span>知识库构建（一次性初始化工作）</h2>
+      <h3>4.1 准备源文档</h3>
+      <p>把敏感资料按密级放入对应目录（支持 28 种扩展名：PDF / Word / Excel / PPT / 图片 / HTML / 纯文本等）：</p>
+      <pre><code>DOC/0Public/          # 公开资料
+DOC/1Restricted/      # 受限资料
+DOC/2Confidential/    # 机密资料</code></pre>
+      <h3>4.2 文件预处理（X2MD）</h3>
+      <ol class="steps">
+        <li>进入「文件预处理」页；</li>
+        <li>选择处理范围（全部密级 / 单个密级）；</li>
+        <li>按需调整：切片策略（父子块）、<code>chunk_size</code> / <code>chunk_overlap</code>、OCR（默认尽量少用，速度慢）、表格提取、LLM 摘要；</li>
+        <li>启动任务等待完成；失败的文件可单独<b>重试</b>。</li>
+      </ol>
+      <p>产物写入 <code>MD/&lt;密级&gt;/</code>：<code>*.md</code> + <code>*.parents.json</code> + <code>*.children.json</code>。</p>
+      <h3>4.3 数据入库（MD2RAG）</h3>
+      <ol class="steps">
+        <li>进入「数据入库」页，启动入库任务；</li>
+        <li>系统先做<b>去重预检</b>：已入库且内容未变的文档自动跳过（提示 <code>skipped</code>）；如需强制重建勾选 force；</li>
+        <li>嵌入默认走 Ollama <code>bge-m3:latest</code>（每批 128 条，串行处理防超时）。</li>
+      </ol>
+      <div class="note">⏱️ 参考耗时：100 GB 文档一次性初始化约 <b>10-20 小时</b>（取决于硬件与是否启用 OCR）；万块级（约 6000 切片）约 30 分钟（Apple M1 实测）。</div>
+      <h3>4.4 数据优化（跨密级去重，可选但推荐）</h3>
+      <ol class="steps">
+        <li>进入「数据优化」页启动去重比对任务（跨密级：受限×公开、机密×公开、机密×受限）；</li>
+        <li>结果按相似度分三档报告（高 ≥0.8 / 中 0.65-0.8 / 弱 0.5-0.65），可人工审查；</li>
+        <li>确认后「应用删除」：从<b>高密级</b>库删除与低密级重复的块（阈值默认 0.75，删除前自动备份 ID 清单到 <code>dedup_results/</code>）；</li>
+        <li>也可开启 <code>auto_dedup</code> 自动执行——<b>不可逆操作，默认关闭</b>。</li>
+      </ol>
+    </section>
+
+    <!-- 5 -->
+    <section class="chapter" id="c5">
+      <h2><span class="no">5</span>文档检测 DocScan（核心功能）</h2>
+      <p>「文档扫描」页含三个标签页：<b>文件扫描 · 文本扫描 · 文件管理</b>。文件检测四步：</p>
+      <h3>5.1 上传待检文档</h3>
+      <ul>
+        <li>支持 <code>.pdf .docx .xlsx .pptx .txt .html .md</code> 共 7 种，大小上限 50 MB；</li>
+        <li>仅保存到 <code>DocScan/</code>，不自动处理；重名自动加后缀。</li>
+      </ul>
+      <h3>5.2 预处理 → 5.3 嵌入 → 5.4 层级比对</h3>
+      <ol class="steps">
+        <li>依次点击三个按钮（预处理 / 生成向量 / 层级比对）；嵌入为后台任务，可取消；</li>
+        <li><b>层级比对</b>（核心）：摘要 → 父块 → 子块逐级与三密级库比对，某级相似度 ≥ 80% 即跳过下级（整块标记高度相似），融合向量相似度 + 字面 n-gram + 连续匹配段 + 可选 reranker 打分。</li>
+      </ol>
+      <h3>5.5 结果解读</h3>
+      <ul>
+        <li>每个切片输出三密级相似度，形如 <code>/ARAG-end/public:0.85,restricted:0.72,confidential:0.91</code>；</li>
+        <li>高度相似显示 <code>SKIPPED:高度相似(public:0.92)</code>；</li>
+        <li>命中片段可<b>定位到原文位置</b>（bbox 高亮），相似度分档：</li>
+      </ul>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>档位</th><th>相似度</th><th>含义</th></tr></thead>
+          <tbody>
+            <tr><td><b>高</b></td><td>≥ 0.8</td><td>高度相似（几乎确定命中）</td></tr>
+            <tr><td><b>中</b></td><td>0.65 – 0.8</td><td>中度相似（需人工确认）</td></tr>
+            <tr><td><b>弱</b></td><td>0.5 – 0.65</td><td>弱相关（仅供参考）</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="warn">相似度为「adjusted」尺度：对 bge-m3 做了基线校正 <code>(raw − 0.37) / 0.63</code>，与原始余弦值不可混用。</div>
+    </section>
+
+    <!-- 6 -->
+    <section class="chapter" id="c6">
+      <h2><span class="no">6</span>文本扫描（即时检测）</h2>
+      <p>「文档扫描」→「文本扫描」标签页：直接粘贴文本（≥ 10 字符）→ 点击扫描 → 立即输出各密级相似度汇总与命中片段位置标注。</p>
+      <p>适用于快速抽查段落、邮件、聊天记录等。</p>
+    </section>
+
+    <!-- 7 -->
+    <section class="chapter" id="c7">
+      <h2><span class="no">7</span>系统设置</h2>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>类别</th><th>可调项</th></tr></thead>
+          <tbody>
+            <tr><td><b>通用</b></td><td>相似度阈值、上传大小上限、日志等</td></tr>
+            <tr><td><b>切片</b></td><td><code>chunk_size</code> / <code>chunk_overlap</code> / 切片策略</td></tr>
+            <tr><td><b>嵌入</b></td><td>嵌入模型：<code>ollama-bge-m3</code>（默认）或 <code>mps-bge-m3</code>（Apple Silicon 本地推理）</td></tr>
+            <tr><td><b>OCR</b></td><td>语言（<code>chi_sim+eng</code> / <code>chi_sim</code> / <code>eng</code>）、是否启用</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="warn">⚠️ <b>切换嵌入模型会清空并重建向量库</b>（维度 / 语义空间不一致），属不可逆操作，切换后需重新入库。</div>
+      <p>设置持久化于 <code>runtime_settings.json</code>，重启后生效。</p>
+    </section>
+
+    <!-- 8 -->
+    <section class="chapter" id="c8">
+      <h2><span class="no">8</span>数据库管理</h2>
+      <ul>
+        <li>查看各密级 parent / child 集合的块数统计；</li>
+        <li><b>重置数据库</b>：清空全部向量集合，不可逆，请确认已有备份。</li>
+      </ul>
+      <p>备份提示：<code>vector_db/</code> 整体复制即备份；仓库保留 <code>vector_db_backup_*</code> 历史备份目录。</p>
+    </section>
+
+    <!-- 9 -->
+    <section class="chapter" id="c9">
+      <h2><span class="no">9</span>常见问题（FAQ）</h2>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>问题</th><th>处理</th></tr></thead>
+          <tbody>
+            <tr><td><b>启动后页面打不开</b></td><td>检查后端日志 <code>backend.log</code>；确认 Ollama 已启动（<code>ollama list</code> 含 bge-m3:latest）</td></tr>
+            <tr><td><b>入库报「维度不匹配」</b></td><td>曾切换嵌入模型——重置数据库后重新入库</td></tr>
+            <tr><td><b>入库中途内存高 / 被杀</b></td><td>系统已做恒定内存流式设计；若仍 OOM，逐密级入库并关闭图片入库</td></tr>
+            <tr><td><b>任务做到一半关页面</b></td><td>后台任务继续执行；重开页面自动恢复进度显示</td></tr>
+            <tr><td><b>OCR 极慢</b></td><td>属正常（OCR 是兜底）；批量文档尽量用原生文本格式</td></tr>
+            <tr><td><b>去重想反悔</b></td><td><code>dedup_results/</code> 中保留删除 ID 备份 JSON；如做了整体备份可恢复</td></tr>
+            <tr><td><b>检测结果分数普遍偏高</b></td><td>bge-m3 不相关文本基线约 0.37，展示分数已重标定；阈值可在系统设置调整</td></tr>
+            <tr><td><b>换机器 / 迁移</b></td><td>整目录复制；若嵌入模型版本不同，清库重新入库</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 10 -->
+    <section class="chapter" id="c10">
+      <h2><span class="no">10</span>安全与数据说明</h2>
+      <ul>
+        <li><b>数据不出内网</b>：嵌入（Ollama）与向量库（ChromaDB）全部本地运行，无需外部 API；</li>
+        <li>上传文件名防路径穿越、扩展名白名单、大小限制；</li>
+        <li>去重删除、模型切换等破坏性操作均有备份或明确提示；</li>
+        <li>建议定期备份 <code>vector_db/</code> 与 <code>dedup_results/</code>。</li>
+      </ul>
+    </section>
+
+    <footer>
+      本说明基于 v0.2.0 源码与界面实测整理 · 接口细节见 README.md 与 backend/app/api/endpoints.py · 2026-09-12
+    </footer>
+  </main>
+</div>
+
+<script>
+(function () {
+  var root = document.documentElement;
+  var btn = document.getElementById('themeToggle');
+  function storedTheme() { try { return localStorage.getItem('arag-manual-theme'); } catch (e) { return null; } }
+  function systemDark() { return window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches; }
+  function currentTheme() {
+    var t = storedTheme();
+    if (t === 'light' || t === 'dark') return t;
+    return systemDark() ? 'dark' : 'light';
+  }
+  function render() {
+    var t = currentTheme();
+    root.dataset.theme = t;
+    btn.textContent = t === 'dark' ? '☀️ 浅色模式' : '🌙 深色模式';
+  }
+  btn.addEventListener('click', function () {
+    var next = currentTheme() === 'dark' ? 'light' : 'dark';
+    try { localStorage.setItem('arag-manual-theme', next); } catch (e) {}
+    render();
+  });
+  render();
+
+  // 目录当前章节高亮（滚动监听）
+  var links = document.querySelectorAll('.toc a');
+  var chapters = document.querySelectorAll('section.chapter');
+  function onScroll() {
+    var pos = window.scrollY + 100;
+    var current = null;
+    chapters.forEach(function (c) {
+      if (c.offsetTop <= pos) current = c.id;
+    });
+    links.forEach(function (a) {
+      a.classList.toggle('active', a.getAttribute('href') === '#' + current);
+    });
+  }
+  window.addEventListener('scroll', onScroll, { passive: true });
+  onScroll();
+})();
+</script>
+</body>
+</html>
