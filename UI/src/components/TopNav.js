@@ -22,7 +22,7 @@ const TopNav = ({ activeMenu, onMenuChange }) => {
     <nav className="top-nav">
       <div className="nav-logo">
         <span style={{ color: '#fff', fontSize: '20px', marginRight: '8px' }}>🛡️</span>
-        <span className="nav-title">敏感信息识别系统</span>
+        <span className="nav-title">定密审核系统</span>
       </div>
 
       <div className="nav-menu">

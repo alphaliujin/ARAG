@@ -36,7 +36,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
-    description="敏感信息识别系统 - 基于向量数据库的文档涉密/机密信息检测",
+    description="定密审核系统 - 基于向量数据库的文档涉密/机密信息检测",
     lifespan=lifespan,
 )
 

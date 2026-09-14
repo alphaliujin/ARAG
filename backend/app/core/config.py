@@ -3,7 +3,7 @@ from typing import List, Optional
 import os
 
 class Settings(BaseSettings):
-    PROJECT_NAME: str = "敏感信息识别系统"
+    PROJECT_NAME: str = "定密审核系统"
     VERSION: str = "0.2.7"
     API_PREFIX: str = "/api/v1"
 
